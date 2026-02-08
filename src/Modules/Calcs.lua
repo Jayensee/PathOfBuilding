@@ -10,6 +10,9 @@ local s_format = string.format
 local m_min = math.min
 local m_ceil = math.ceil
 
+-- List of all damage types, ordered according to the conversion sequence
+local dmgTypeList = {"Physical", "Lightning", "Cold", "Fire", "Chaos"}
+
 local calcs = { }
 calcs.breakdownModule = "Modules/CalcBreakdown"
 LoadModule("Modules/CalcSetup", calcs)
@@ -80,6 +83,13 @@ local function getCalculator(build, fullInit, modFunc)
 	env.player.output.SkillDPS = fullDPS.skills
 	env.player.output.FullDPS = fullDPS.combinedDPS
 	env.player.output.FullDotDPS = fullDPS.TotalDotDPS
+
+	local output = env.player.output
+	local reciprocal_sum = 0.0
+	for _, damageType in ipairs(dmgTypeList) do
+		reciprocal_sum = reciprocal_sum + 1 / output[damageType.."IgnoreableDot"]
+	end
+	env.player.output.PowerMetric = ((output.EffectiveMaximumHitTaken * output.TotalEHP * 5 / reciprocal_sum ) ^ (1/3)) * output.FullDPS / 1000000
 	local baseOutput = env.player.output
 
 	env.modDB.parent = cachedPlayerDB
@@ -107,6 +117,14 @@ local function getCalculator(build, fullInit, modFunc)
 		env.player.output.FullDPS = fullDPS.combinedDPS
 		env.player.output.FullDotDPS = fullDPS.TotalDotDPS
 
+		local output = env.player.output
+		local reciprocal_sum = 0.0
+		for _, damageType in ipairs(dmgTypeList) do
+			reciprocal_sum = reciprocal_sum + 1 / output[damageType.."IgnoreableDot"]
+		end
+		env.player.output.PowerMetric = ((output.EffectiveMaximumHitTaken * output.TotalEHP * 5 / reciprocal_sum ) ^ (1/3)) * output.FullDPS / 1000000
+
+
 		return env.player.output
 	end, baseOutput	
 end
@@ -130,6 +148,14 @@ function calcs.getMiscCalculator(build)
 		env.player.output.SkillDPS = fullDPS.skills
 		env.player.output.FullDPS = fullDPS.combinedDPS
 		env.player.output.FullDotDPS = fullDPS.TotalDotDPS
+		
+		local output = env.player.output
+		local reciprocal_sum = 0.0
+		for _, damageType in ipairs(dmgTypeList) do
+			reciprocal_sum = reciprocal_sum + 1 / output[damageType.."IgnoreableDot"]
+		end
+		env.player.output.PowerMetric = ((output.EffectiveMaximumHitTaken * output.TotalEHP * 5 / reciprocal_sum ) ^ (1/3)) * output.FullDPS / 1000000
+
 	end
 	return function(override, useFullDPS)
 		local env, cachedPlayerDB, cachedEnemyDB, cachedMinionDB = calcs.initEnv(build, "CALCULATOR", override)
@@ -142,6 +168,13 @@ function calcs.getMiscCalculator(build)
 			env.player.output.SkillDPS = fullDPS.skills
 			env.player.output.FullDPS = fullDPS.combinedDPS
 			env.player.output.FullDotDPS = fullDPS.TotalDotDPS
+			
+			local output = env.player.output
+			local reciprocal_sum = 0.0
+			for _, damageType in ipairs(dmgTypeList) do
+				reciprocal_sum = reciprocal_sum + 1 / output[damageType.."IgnoreableDot"]
+			end
+			env.player.output.PowerMetric = ((output.EffectiveMaximumHitTaken * output.TotalEHP * 5 / reciprocal_sum ) ^ (1/3)) * output.FullDPS / 1000000
 		end
 		return env.player.output
 	end, env.player.output
@@ -427,6 +460,13 @@ function calcs.buildOutput(build, mode)
 	env.player.output.SkillDPS = fullDPS.skills
 	env.player.output.FullDPS = fullDPS.combinedDPS
 	env.player.output.FullDotDPS = fullDPS.TotalDotDPS
+	
+	local output = env.player.output
+	local reciprocal_sum = 0.0
+	for _, damageType in ipairs(dmgTypeList) do
+		reciprocal_sum = reciprocal_sum + 1 / output[damageType.."IgnoreableDot"]
+	end
+	env.player.output.PowerMetric = ((output.EffectiveMaximumHitTaken * output.TotalEHP * 5 / reciprocal_sum ) ^ (1/3)) * output.FullDPS / 1000000
 
 	if mode == "MAIN" then
 		for _, skill in ipairs(env.player.activeSkillList) do

@@ -203,6 +203,8 @@ local displayStats = {
 	{ stat = "FullDotDPS", label = "Full Dot DPS", fmt = ".1f", color = colorCodes.CURRENCY, compPercent = true, condFunc = function (v) return v >= data.misc.DotDpsCap end, warnFunc = function (v) return "Full Dot DPS exceeds in game limit" end },
 	{ },
 	{ stat = "SkillDPS", label = "Skill DPS", condFunc = function() return true end },
+	{ },
+	{ stat = "PowerMetric", label = "Power Metric", fmt = ".0f", compPercent = true },
 }
 local minionDisplayStats = {
 	{ stat = "AverageDamage", label = "Average Damage", fmt = ".1f", compPercent = true },

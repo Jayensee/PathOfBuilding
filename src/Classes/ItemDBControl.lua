@@ -223,7 +223,7 @@ function ItemDBClass:ListBuilder()
 	end
 
 	if self.sortDetail and self.sortDetail.stat then -- stat-based
-		local useFullDPS = self.sortDetail.stat == "FullDPS"
+		local useFullDPS = (self.sortDetail.stat == "FullDPS") or (self.sortDetail.stat == "PowerMetric")
 		local start = GetTime()
 		local calcFunc, calcBase = self.itemsTab.build.calcsTab:GetMiscCalculator(self.build)
 		for itemIndex, item in ipairs(list) do

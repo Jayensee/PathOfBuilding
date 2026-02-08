@@ -109,6 +109,7 @@ data = { }
 LoadModule("Data/Misc", data)
 
 data.powerStatList = {
+	{ stat="PowerMetric", label="Power Metric" },
 	{ stat=nil, label="Offence/Defence", combinedOffDef=true, ignoreForItems=true },
 	{ stat=nil, label="Name", itemField="Name", ignoreForNodes=true, reverseSort=true, transform=function(value) return value:gsub("^The ","") end},
 	{ stat="FullDPS", label="Full DPS" },

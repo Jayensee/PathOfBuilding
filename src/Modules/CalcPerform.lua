@@ -20,6 +20,9 @@ local bor = bit.bor
 local band = bit.band
 local bnot = bit.bnot
 
+local dmgTypeList = {"Physical", "Lightning", "Cold", "Fire", "Chaos"}
+
+
 --- getCachedOutputValue
 ---  retrieves a value specified by key from a cached version of skill
 ---  specified by @uuid or if not found in cache computes teh cache.
@@ -2188,7 +2191,6 @@ function calcs.perform(env, skipEHP)
 								local inc = modStore:Sum("INC", skillCfg, "BuffEffect") + env.minion.modDB:Sum("INC", skillCfg, "BuffEffectOnSelf")
 								local rallyingBonusMoreMultiplier = 1 + (activeSkill.skillModList:Sum("BASE", env.player.mainSkill.skillCfg, "RallyingCryMinionDamageBonusMultiplier") or 0)
 								-- Add all damage types
-								local dmgTypeList = {"Physical", "Lightning", "Cold", "Fire", "Chaos"}
 								for _, damageType in ipairs(dmgTypeList) do
 									if env.player.weaponData1[damageType.."Min"] then
 										extraWarcryModList:NewMod(damageType.."Min", "BASE", (env.player.weaponData1[damageType.."Min"] * rallyingWeaponEffect / 100), "Rallying Cry", 0, KeywordFlag.Attack, { type = "GlobalEffect", effectType = "Warcry", div = 5, limit = 30 })
@@ -3400,6 +3402,9 @@ function calcs.perform(env, skipEHP)
 		end
 		calcs.triggers(env, env.minion)
 		calcs.offence(env, env.minion, env.minion.mainSkill)
+	end
+	for _, damageType in ipairs(dmgTypeList) do
+		output[damageType.."IgnoreableDot"] = ((output.NetEnergyShieldRegen or output.EnergyShieldRegenRecovery) + (output.NetLifeRegen or output.LifeRegenRecovery) + (output.EnergyShieldLeechGainRate or 0) / 3 + (output.LifeLeechGainRate or 0) / 3) / (output[damageType.."TakenDotMult"] or 1)
 	end
 
 	 -- Export modifiers to enemy conditions and stats for party tab
