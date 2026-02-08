@@ -194,6 +194,9 @@ local TreeTabClass = newClass("TreeTab", "ControlHost", function(self, build)
 	self.controls.treeHeatMap = new("CheckBoxControl", { "LEFT", self.controls.findTimelessJewel, "RIGHT" }, { 130, 0, 20 }, "Show Node Power:", function(state)
 		self.viewer.showHeatMap = state
 		self.controls.treeHeatMapStatSelect.shown = state
+		if not self.build.calcsTab.powerStat then
+			self.build.calcsTab.powerStat = data.powerStatList[1]
+		end
 
 		if state == false then
 			self.controls.powerReportList.shown = false 
