@@ -89,7 +89,7 @@ local function getCalculator(build, fullInit, modFunc)
 	for _, damageType in ipairs(dmgTypeList) do
 		reciprocal_sum = reciprocal_sum + 1 / output[damageType.."IgnoreableDot"]
 	end
-	env.player.output.PowerMetric = ((output.EffectiveMaximumHitTaken * output.TotalEHP * 5 / reciprocal_sum ) ^ (1/3)) * output.FullDPS / 1000000
+	env.player.output.PowerMetric = ((1/(1/output.EffectiveMaximumHitTaken + 1/output.TotalEHP) ^ 2 * 5 / reciprocal_sum ) ^ (1/3)) * output.FullDPS / 1000000
 	local baseOutput = env.player.output
 
 	env.modDB.parent = cachedPlayerDB
@@ -122,7 +122,7 @@ local function getCalculator(build, fullInit, modFunc)
 		for _, damageType in ipairs(dmgTypeList) do
 			reciprocal_sum = reciprocal_sum + 1 / output[damageType.."IgnoreableDot"]
 		end
-		env.player.output.PowerMetric = ((output.EffectiveMaximumHitTaken * output.TotalEHP * 5 / reciprocal_sum ) ^ (1/3)) * output.FullDPS / 1000000
+		env.player.output.PowerMetric = ((1/(1/output.EffectiveMaximumHitTaken + 1/output.TotalEHP) ^ 2 * 5 / reciprocal_sum ) ^ (1/3)) * output.FullDPS / 1000000
 
 
 		return env.player.output
@@ -154,7 +154,7 @@ function calcs.getMiscCalculator(build)
 		for _, damageType in ipairs(dmgTypeList) do
 			reciprocal_sum = reciprocal_sum + 1 / output[damageType.."IgnoreableDot"]
 		end
-		env.player.output.PowerMetric = ((output.EffectiveMaximumHitTaken * output.TotalEHP * 5 / reciprocal_sum ) ^ (1/3)) * output.FullDPS / 1000000
+		env.player.output.PowerMetric = ((1/(1/output.EffectiveMaximumHitTaken + 1/output.TotalEHP) ^ 2 * 5 / reciprocal_sum ) ^ (1/3)) * output.FullDPS / 1000000
 
 	end
 	return function(override, useFullDPS)
@@ -174,7 +174,7 @@ function calcs.getMiscCalculator(build)
 			for _, damageType in ipairs(dmgTypeList) do
 				reciprocal_sum = reciprocal_sum + 1 / output[damageType.."IgnoreableDot"]
 			end
-			env.player.output.PowerMetric = ((output.EffectiveMaximumHitTaken * output.TotalEHP * 5 / reciprocal_sum ) ^ (1/3)) * output.FullDPS / 1000000
+			env.player.output.PowerMetric = ((1/(1/output.EffectiveMaximumHitTaken + 1/output.TotalEHP) ^ 2 * 5 / reciprocal_sum ) ^ (1/3)) * output.FullDPS / 1000000
 		end
 		return env.player.output
 	end, env.player.output
@@ -466,7 +466,7 @@ function calcs.buildOutput(build, mode)
 	for _, damageType in ipairs(dmgTypeList) do
 		reciprocal_sum = reciprocal_sum + 1 / output[damageType.."IgnoreableDot"]
 	end
-	env.player.output.PowerMetric = ((output.EffectiveMaximumHitTaken * output.TotalEHP * 5 / reciprocal_sum ) ^ (1/3)) * output.FullDPS / 1000000
+	env.player.output.PowerMetric = ((1/(1/output.EffectiveMaximumHitTaken + 1/output.TotalEHP) ^ 2 * 5 / reciprocal_sum ) ^ (1/3)) * output.FullDPS / 1000000
 
 	if mode == "MAIN" then
 		for _, skill in ipairs(env.player.activeSkillList) do
