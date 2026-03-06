@@ -328,7 +328,7 @@ function GemSelectClass:UpdateSortCache()
 	end
 
 	local dpsField = self.skillsTab.sortGemsByDPSField
-	local useFullDPS = dpsField == "FullDPS"
+	local useFullDPS = (dpsField == "FullDPS") or (dpsField == "PowerMetric")
 	local calcFunc, calcBase = self.skillsTab.build.calcsTab:GetMiscCalculator(self.build)
 	-- Check for nil because some fields may not be populated, default to 0
 	local baseDPS = (dpsField == "FullDPS" and calcBase[dpsField] ~= nil and calcBase[dpsField]) or (calcBase.Minion and calcBase.Minion.CombinedDPS) or (calcBase[dpsField] ~= nil and calcBase[dpsField]) or 0

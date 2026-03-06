@@ -59,6 +59,7 @@ local showSupportGemTypeList = {
 }
 
 local sortGemTypeList = {
+	{ label = "Power Metric", type = "PowerMetric" },
 	{ label = "Full DPS", type = "FullDPS" },
 	{ label = "Combined DPS", type = "CombinedDPS" },
 	{ label = "Hit DPS", type = "TotalDPS" },
