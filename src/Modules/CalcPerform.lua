@@ -1252,6 +1252,7 @@ function calcs.perform(env, skipEHP)
 		applyEnemyModifiers(env.minion, true)
 	end
 	applyEnemyModifiers(env.enemy, true)
+	local minionCount = {}
 
 	for _, activeSkill in ipairs(env.player.activeSkillList) do
 		if activeSkill.skillTypes[SkillType.Brand] then
@@ -1334,6 +1335,13 @@ function calcs.perform(env, skipEHP)
 		if activeSkill.minion and activeSkill.minion.minionData and activeSkill.minion.minionData.limit then
 			local limit = m_floor(modDB:Override(nil, activeSkill.minion.minionData.limit) or (calcLib.val(activeSkill.skillModList, activeSkill.minion.minionData.limit) * activeSkill.skillModList:More(activeSkill.skillCfg, "ActiveMinionLimit")))
 			output[activeSkill.minion.minionData.limit] = m_max(limit, output[activeSkill.minion.minionData.limit] or 0)
+			if not minionCount[activeSkill.minion.minionData.limit] then
+				env.player.modDB:NewMod("Multiplier:SummonedMinion", "BASE", output[activeSkill.minion.minionData.limit], "Config", { type = "Condition", var = "Combat" })
+				if not activeSkill.skillTypes[SkillType.Vaal] then
+					env.player.modDB:NewMod("Multiplier:NonVaalSummonedMinion", "BASE", output[activeSkill.minion.minionData.limit], "Config", { type = "Condition", var = "Combat" })
+				end
+				minionCount[activeSkill.minion.minionData.limit] = true
+			end
 		end
 		if activeSkill.skillTypes[SkillType.CreatesMinion] and not activeSkill.skillTypes[SkillType.MinionsAreUndamagable] then
 			modDB:NewMod("Condition:HaveDamageableMinion", "FLAG", true)
@@ -2150,7 +2158,7 @@ function calcs.perform(env, skipEHP)
 				-- Nothing!
 			elseif buff.enemyCond and not enemyDB:GetCondition(buff.enemyCond) then
 				-- Also nothing :/
-			elseif buff.type == "Global" then
+			elseif buff.type == "GlobalDB" then
 				modDB:AddList(buff.modList) -- Allows a skill mod to affect other skills through modDB
 			elseif buff.type == "Buff" and not skillModList:Flag(skillCfg, "DisableBuff") then
 				if env.mode_buffs and (not activeSkill.skillFlags.totem or buff.allowTotemBuff) then
@@ -3254,7 +3262,7 @@ function calcs.perform(env, skipEHP)
 	buffExports["Aura"]["extraAura"] = { effectMult = 1, modList = new("ModList") }
 	for _, value in ipairs(modDB:List(nil, "ExtraAura")) do
 		local modList = { value.mod }
-		if not value.onlyAllies then
+		if not value.onlyAllies and not (value.fromAllies and modDB:Flag(nil, "AlliesAurasCannotAffectSelf")) then
 			local inc = modDB:Sum("INC", nil, "BuffEffectOnSelf", "AuraEffectOnSelf")
 			local more = modDB:More(nil, "BuffEffectOnSelf", "AuraEffectOnSelf")
 			modDB:ScaleAddList(modList, (1 + inc / 100) * more)
@@ -3262,7 +3270,7 @@ function calcs.perform(env, skipEHP)
 				modDB.multipliers["BuffOnSelf"] = (modDB.multipliers["BuffOnSelf"] or 0) + 1
 			end
 		end
-		if not modDB:Flag(nil, "SelfAurasCannotAffectAllies") then
+		if value.fromAllies or not modDB:Flag(nil, "SelfAurasCannotAffectAllies") then
 			if env.minion then
 				local inc = env.minion.modDB:Sum("INC", nil, "BuffEffectOnSelf", "AuraEffectOnSelf")
 				local more = env.minion.modDB:More(nil, "BuffEffectOnSelf", "AuraEffectOnSelf")
