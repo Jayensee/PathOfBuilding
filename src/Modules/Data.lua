@@ -574,7 +574,13 @@ data.describeStats = LoadModule("Modules/StatDescriber")
 
 -- Load item modifiers
 data.itemMods = {
-	Item = LoadModule("Data/ModItem"),
+	Explicit = LoadModule("Data/ModExplicit"),
+	Implicit = LoadModule("Data/ModImplicit"),
+	Corrupted = LoadModule("Data/ModCorrupted"),
+	Delve = LoadModule("Data/ModDelve"),
+	Synthesis = LoadModule("Data/ModSynthesis"),
+	Scourge = LoadModule("Data/ModScourge"),
+	Eldritch = LoadModule("Data/ModEldritch"),
 	Flask = LoadModule("Data/ModFlask"),
 	Tincture = LoadModule("Data/ModTincture"),
 	Graft = LoadModule("Data/ModGraft"),
@@ -593,6 +599,16 @@ data.enchantments = {
 	["Weapon"] = LoadModule("Data/EnchantmentWeapon"),
 	["UtilityFlask"] = LoadModule("Data/EnchantmentFlask"),
 }
+
+-- combined table of many mod categories
+data.itemMods.Item = {}
+for _, key in ipairs({ "Explicit", "Implicit", "Corrupted", "Delve", "Synthesis", "Scourge", "Eldritch" }) do
+	local itemData = data.itemMods[key]
+	for k, v in pairs(itemData) do
+		data.itemMods.Item[k] = v
+	end
+end
+
 do
 	data.enchantments["Flask"] = data.enchantments["UtilityFlask"]--["HARVEST"]
 	for baseType, _ in pairs(data.weaponTypeInfo) do
