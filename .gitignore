@@ -12,6 +12,7 @@ inspect.lua
 Builds/
 *.cfg
 Settings.xml
+StashItems.xml
 
 # Testing
 luajit/
