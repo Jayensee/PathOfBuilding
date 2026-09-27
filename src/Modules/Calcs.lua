@@ -104,11 +104,6 @@ local function getCalculator(build, fullInit, modFunc)
 	env.player.output.FullDPS = fullDPS.combinedDPS
 	env.player.output.FullDotDPS = fullDPS.TotalDotDPS
 
-	local output = env.player.output
-	local reciprocal_sum = 0.0
-	for _, damageType in ipairs(dmgTypeList) do
-		reciprocal_sum = reciprocal_sum + 1 / output[damageType.."IgnoreableDot"]
-	end
 	env.player.output.PowerMetric = powerMetricCalc(env)
 	local baseOutput = env.player.output
 
@@ -137,11 +132,6 @@ local function getCalculator(build, fullInit, modFunc)
 		env.player.output.FullDPS = fullDPS.combinedDPS
 		env.player.output.FullDotDPS = fullDPS.TotalDotDPS
 
-		local output = env.player.output
-		local reciprocal_sum = 0.0
-		for _, damageType in ipairs(dmgTypeList) do
-			reciprocal_sum = reciprocal_sum + 1 / output[damageType.."IgnoreableDot"]
-		end
 		env.player.output.PowerMetric = powerMetricCalc(env)
 
 
@@ -169,11 +159,6 @@ function calcs.getMiscCalculator(build)
 		env.player.output.FullDPS = fullDPS.combinedDPS
 		env.player.output.FullDotDPS = fullDPS.TotalDotDPS
 		
-		local output = env.player.output
-		local reciprocal_sum = 0.0
-		for _, damageType in ipairs(dmgTypeList) do
-			reciprocal_sum = reciprocal_sum + 1 / output[damageType.."IgnoreableDot"]
-		end
 		env.player.output.PowerMetric = powerMetricCalc(env)
 
 	end
@@ -189,11 +174,6 @@ function calcs.getMiscCalculator(build)
 			env.player.output.FullDPS = fullDPS.combinedDPS
 			env.player.output.FullDotDPS = fullDPS.TotalDotDPS
 			
-			local output = env.player.output
-			local reciprocal_sum = 0.0
-			for _, damageType in ipairs(dmgTypeList) do
-				reciprocal_sum = reciprocal_sum + 1 / output[damageType.."IgnoreableDot"]
-			end
 			env.player.output.PowerMetric = powerMetricCalc(env)
 		end
 		return env.player.output
@@ -472,7 +452,6 @@ function calcs.buildOutput(build, mode)
 	local env, cachedPlayerDB, cachedEnemyDB, cachedMinionDB = calcs.initEnv(build, mode)
 	calcs.perform(env)
 
-	local output = env.player.output
 
 	-- Build output across all skills added to FullDPS skills
 	local fullDPS = calcs.calcFullDPS(build, "CALCULATOR", {}, { cachedPlayerDB = cachedPlayerDB, cachedEnemyDB = cachedEnemyDB, cachedMinionDB = cachedMinionDB, env = nil })
@@ -482,8 +461,6 @@ function calcs.buildOutput(build, mode)
 	env.player.output.FullDPS = fullDPS.combinedDPS
 	env.player.output.FullDotDPS = fullDPS.TotalDotDPS
 	
-	local output = env.player.output
-	local reciprocal_sum = 0.0
 	for _, damageType in ipairs(dmgTypeList) do
 		reciprocal_sum = reciprocal_sum + 1 / output[damageType.."IgnoreableDot"]
 	end
