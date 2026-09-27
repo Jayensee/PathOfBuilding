@@ -46,9 +46,13 @@ local function powerMetricCalc(env)
 	if type(output.AreaOfEffectMod) == "number" then
 		aoe_mod = output.AreaOfEffectMod
 	end
+	local speed = 1.0
+	if type(output.Speed) == "number" then
+		speed = output.Speed
+	end
 	local tank_metric = ((1/(1/output.EffectiveMaximumHitTaken + 1/output.TotalEHP) ^ 2 * 5 / reciprocal_sum ) ^ (1/3))
 	local damage_metric = output.FullDPS
-	local utility_metric = (aoe_mod * (output.Speed or aoe_mod)) ^ (1/2)
+	local utility_metric = (aoe_mod * (speed^4 or 1)) ^ (1/5)
 	return tank_metric * damage_metric * utility_metric  / 1000
 end
 
