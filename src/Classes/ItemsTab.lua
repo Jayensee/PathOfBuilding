@@ -272,9 +272,10 @@ local ItemsTabClass = newClass("ItemsTab", "UndoHandler", "ControlHost", "Contro
 	-- Database selector
 	self.controls.selectDBLabel = new("LabelControl", {"TOPLEFT",self.controls.itemList,"BOTTOMLEFT"}, {0, 14, 0, 16}, "^7Import from:")
 	self.controls.selectDBLabel.shown = function()
-		return self.height < 980
+		-- Always use the selector once there are stash items, as three lists don't fit stacked
+		return self.height < 980 or next(main.stashDB.list) ~= nil
 	end
-	self.controls.selectDB = new("DropDownControl", {"LEFT",self.controls.selectDBLabel,"RIGHT"}, {4, 0, 150, 18}, { "Uniques", "Rare Templates" })
+	self.controls.selectDB = new("DropDownControl", {"LEFT",self.controls.selectDBLabel,"RIGHT"}, {4, 0, 150, 18}, { "Uniques", "Rare Templates", "Stash Items" })
 
 	-- Unique database
 	self.controls.uniqueDB = new("ItemDBControl", {"TOPLEFT",self.controls.itemList,"BOTTOMLEFT"}, {0, 76, 360, function(c) return m_min(244, self.maxY - select(2, c:GetPos())) end}, self, main.uniqueDB, "UNIQUE")
@@ -292,6 +293,12 @@ local ItemsTabClass = newClass("ItemsTab", "UndoHandler", "ControlHost", "Contro
 	end
 	self.controls.rareDB.shown = function()
 		return not self.controls.selectDBLabel:IsShown() or self.controls.selectDB.selIndex == 2
+	end
+
+	-- Imported stash items database
+	self.controls.stashDB = new("ItemDBControl", {"TOPLEFT",self.controls.itemList,"BOTTOMLEFT"}, {0, 118, 360, function(c) return m_min(244, self.maxY - select(2, c:GetPos())) end}, self, main.stashDB, "STASH")
+	self.controls.stashDB.shown = function()
+		return self.controls.selectDBLabel:IsShown() and self.controls.selectDB.selIndex == 3
 	end
 	-- Create/import item
 	self.controls.craftDisplayItem = new("ButtonControl", {"TOPLEFT",main.portraitMode and self.controls.setManage or self.controls.itemList,"TOPRIGHT"}, {20, main.portraitMode and 0 or -20, 120, 20}, "Craft item...", function()
@@ -1124,12 +1131,16 @@ holding Shift will put it in the second.]])
 	t_insert(self.controls.rareDB.dragTargetList, self.controls.itemList)
 	t_insert(self.controls.rareDB.dragTargetList, self.controls.sharedItemList)
 	t_insert(self.controls.rareDB.dragTargetList, build.controls.mainSkillMinion)
+	t_insert(self.controls.stashDB.dragTargetList, self.controls.itemList)
+	t_insert(self.controls.stashDB.dragTargetList, self.controls.sharedItemList)
+	t_insert(self.controls.stashDB.dragTargetList, build.controls.mainSkillMinion)
 	t_insert(self.controls.sharedItemList.dragTargetList, self.controls.itemList)
 	t_insert(self.controls.sharedItemList.dragTargetList, build.controls.mainSkillMinion)
 	for _, slot in pairs(self.slots) do
 		t_insert(self.controls.itemList.dragTargetList, slot)
 		t_insert(self.controls.uniqueDB.dragTargetList, slot)
 		t_insert(self.controls.rareDB.dragTargetList, slot)
+		t_insert(self.controls.stashDB.dragTargetList, slot)
 		t_insert(self.controls.sharedItemList.dragTargetList, slot)
 	end
 

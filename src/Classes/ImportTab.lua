@@ -467,6 +467,65 @@ local function addAccountNameControls(self)
 	end)
 end
 
+local function addStashControls(self)
+	self.stashImportMode = "IDLE"
+	self.stashImportStatus = "Idle"
+	self.controls.stashImportStatusLabel = new("LabelControl", { "TOPLEFT", self.controls.sectionStashImport, "TOPLEFT" },
+		{ 6, 14, 200, 16 }, function()
+		return "^7Stash import status: " .. self.stashImportStatus
+	end)
+
+	local lastAccount = main.lastAccountName and main.gameAccounts[main.lastAccountName]
+	self.controls.stashSessionIDLabel = new("LabelControl", { "TOPLEFT", self.controls.sectionStashImport, "TOPLEFT" },
+		{ 6, 40, 0, 16 }, "^7POESESSID:")
+	self.controls.stashSessionID = new("EditControl", { "LEFT", self.controls.stashSessionIDLabel, "RIGHT" },
+		{ 4, 0, 260, 20 }, lastAccount and lastAccount.sessionID or "", nil, nil, nil, function(buf)
+			local accountName = self.controls.siteAccountName.buf
+			if accountName ~= "" then
+				main.gameAccounts[accountName] = main.gameAccounts[accountName] or { }
+				main.gameAccounts[accountName].sessionID = buf
+			end
+		end)
+	self.controls.stashSessionID:SetProtected(true)
+	self.controls.stashSessionID.tooltipFunc = function(tooltip)
+		tooltip:Clear()
+		tooltip:AddLine(16, "^7Uses the account name and realm from the section above.")
+		tooltip:AddLine(16, "^7Copy the POESESSID cookie from pathofexile.com while logged in.")
+		tooltip:AddLine(16, "^7Stored in plain text in Settings.xml.")
+	end
+	self.controls.stashLeagueLabel = new("LabelControl", { "LEFT", self.controls.stashSessionID, "RIGHT" },
+		{ 12, 0, 0, 16 }, "^7League:")
+	self.controls.stashLeague = new("DropDownControl", { "LEFT", self.controls.stashLeagueLabel, "RIGHT" },
+		{ 4, 0, 180, 20 }, { "Standard" }, function(index, value)
+			self.stashLastLeague = value
+			-- loaded tabs belong to the previous league
+			self.controls.stashTabSelect:SetList({ })
+			self.stashImportMode = "IDLE"
+		end)
+
+	self.controls.stashLoadTabs = new("ButtonControl", { "TOPLEFT", self.controls.stashSessionIDLabel, "BOTTOMLEFT" },
+		{ 0, 12, 80, 20 }, "Load Tabs", function()
+			self:DownloadStashTabList(self.controls.siteAccountRealm:GetSelValue())
+		end)
+	self.controls.stashLoadTabs.enabled = function()
+		return self.stashImportMode ~= "DOWNLOADING" and self.controls.siteAccountName.buf ~= ""
+			and self.controls.stashSessionID.buf ~= "" and self.controls.stashLeague:GetSelValue() ~= nil
+	end
+	self.controls.stashTabSelect = new("DropDownControl", { "LEFT", self.controls.stashLoadTabs, "RIGHT" },
+		{ 8, 0, 300, 20 }, { })
+	self.controls.stashTabSelect.enabled = function()
+		return self.stashImportMode == "SELECTTAB"
+	end
+	self.controls.stashImportTab = new("ButtonControl", { "LEFT", self.controls.stashTabSelect, "RIGHT" },
+		{ 8, 0, 90, 20 }, "Import Tab", function()
+			local tab = self.controls.stashTabSelect:GetSelValue()
+			self:DownloadStashTab(self.controls.siteAccountRealm:GetSelValue(), tab.index, tab.label)
+		end)
+	self.controls.stashImportTab.enabled = function()
+		return self.stashImportMode == "SELECTTAB" and self.controls.stashTabSelect:GetSelValue() ~= nil
+	end
+end
+
 local ImportTabClass = newClass("ImportTab", "ControlHost", "Control", function(self, build)
 	self.ControlHost()
 	self.Control()
@@ -489,10 +548,15 @@ local ImportTabClass = newClass("ImportTab", "ControlHost", "Control", function(
 		"Import By Account Name")
 	addAccountNameControls(self)
 
+	self.controls.sectionStashImport = new("SectionControl",
+		{ "TOPLEFT", self.controls.sectionCharSiteImport, "BOTTOMLEFT" },
+		{ 0, 18, 650, 100 },
+		"Import Stash Tab")
+	addStashControls(self)
 
 	-- Build import/export
 	self.controls.sectionBuild = new("SectionControl",
-		{ "TOPLEFT", self.controls.sectionCharSiteImport, "BOTTOMLEFT", true },
+		{ "TOPLEFT", self.controls.sectionStashImport, "BOTTOMLEFT", true },
 		{ 0, 18, 650, 182 }, "Build Sharing")
 	self.controls.generateCodeLabel = new("LabelControl", { "TOPLEFT", self.controls.sectionBuild, "TOPLEFT" },
 		{ 6, 14, 0, 16 }, "^7Generate a code to share this build with other Path of Building users:")
@@ -774,6 +838,12 @@ function ImportTabClass:Draw(viewPort, inputEvents)
 	self.width = viewPort.width
 	self.height = viewPort.height
 
+	-- Fetch the stash league list lazily, and again whenever the realm changes
+	local realm = self.controls.siteAccountRealm:GetSelValue()
+	if realm and self.stashLeaguesRealm ~= realm.realmCode then
+		self:FetchStashLeagues(realm.realmCode)
+	end
+
 	self:ProcessControlsInput(inputEvents, viewPort)
 
 	main:DrawBackground(viewPort)
@@ -874,6 +944,122 @@ function ImportTabClass:DownloadItems(realm)
 			self:ImportItemsAndSkills(charData, clearItems, clearSkills, ignoreWeaponSwap)
 		end)
 end
+
+function ImportTabClass:DownloadStashPage(realm, tabIndex, includeTabs, callback)
+	local accountName = self.controls.siteAccountName.buf
+	local sessionID = self.controls.stashSessionID.buf
+	main.gameAccounts[accountName] = main.gameAccounts[accountName] or { }
+	main.gameAccounts[accountName].sessionID = sessionID
+	local prevMode = self.stashImportMode
+	self.stashImportMode = "DOWNLOADING"
+	launch:DownloadPage(
+		realm.hostName .. "character-window/get-stash-items?accountName=" .. accountName:gsub("#", "%%23") ..
+		"&realm=" .. realm.realmCode .. "&league=" .. urlEncode(self.controls.stashLeague:GetSelValue()) ..
+		"&tabs=" .. (includeTabs and "1" or "0") .. "&tabIndex=" .. tabIndex,
+		function(response, errMsg)
+			self.stashImportMode = prevMode
+			if errMsg == "Response code: 401" or errMsg == "Response code: 403" then
+				self.stashImportStatus = colorCodes.NEGATIVE .. "Session ID invalid/expired, or account name is wrong (case-sensitive)."
+				return
+			elseif errMsg then
+				self.stashImportStatus = colorCodes.NEGATIVE .. "Error retrieving stash (" .. errMsg:gsub("\n", " ") .. ")"
+				return
+			end
+			local data = response and response.body and dkjson.decode(response.body)
+			if type(data) ~= "table" then
+				self.stashImportStatus = colorCodes.NEGATIVE .. "Failed to parse stash response."
+				return
+			elseif data.error then
+				self.stashImportStatus = colorCodes.NEGATIVE .. "Error: " .. tostring(data.error.message or data.error.code)
+				return
+			end
+			callback(data)
+		end, { header = "Cookie: POESESSID=" .. sessionID })
+end
+
+-- Fills the stash league dropdown from the public league list (includes SSF, unlike the trade league list)
+function ImportTabClass:FetchStashLeagues(realmCode)
+	self.stashLeaguesRealm = realmCode
+	launch:DownloadPage("https://www.pathofexile.com/api/leagues?type=main&compact=1&realm=" .. realmCode, function(response, errMsg)
+		if self.stashLeaguesRealm ~= realmCode then
+			-- realm changed while the request was in flight
+			return
+		end
+		local leagues = not errMsg and response and response.body and dkjson.decode(response.body)
+		if type(leagues) ~= "table" or leagues.error then
+			ConPrintf("Failed to fetch league list: %s", tostring(errMsg))
+			leagues = { }
+		end
+		-- temporary leagues first, permanent ones (no end date) last
+		table.sort(leagues, function(a, b)
+			if (a.endAt == nil) ~= (b.endAt == nil) then
+				return b.endAt == nil
+			end
+			return a.id < b.id
+		end)
+		local list = { }
+		for _, league in ipairs(leagues) do
+			if type(league) == "table" and league.id then
+				t_insert(list, league.id)
+			end
+		end
+		if not isValueInArray(list, "Standard") then
+			t_insert(list, "Standard")
+		end
+		local control = self.controls.stashLeague
+		control:SetList(list)
+		control.selIndex = 1
+		local preferred = self.stashLastLeague or self.lastLeague
+		for i, league in ipairs(list) do
+			if league == preferred then
+				control:SetSel(i, true)
+				break
+			end
+		end
+	end)
+end
+
+function ImportTabClass:DownloadStashTabList(realm)
+	self.stashImportStatus = "Retrieving stash tab list..."
+	self:DownloadStashPage(realm, 0, true, function(data)
+		local list = { }
+		for _, tab in ipairs(data.tabs or { }) do
+			if not tab.hidden then
+				t_insert(list, { label = tab.n, index = tab.i })
+			end
+		end
+		if #list == 0 then
+			self.stashImportStatus = colorCodes.NEGATIVE .. "No stash tabs found in this league."
+			self.stashImportMode = "IDLE"
+			return
+		end
+		self.controls.stashTabSelect:SetList(list)
+		self.controls.stashTabSelect.selIndex = 1
+		self.stashImportStatus = colorCodes.POSITIVE .. #list .. " stash tabs loaded."
+		self.stashImportMode = "SELECTTAB"
+	end)
+end
+
+function ImportTabClass:DownloadStashTab(realm, tabIndex, tabName)
+	self.stashImportStatus = "Retrieving stash tab '" .. tabName .. "'..."
+	local league = self.controls.stashLeague:GetSelValue()
+	self:DownloadStashPage(realm, tabIndex, false, function(data)
+		local items = data.items or { }
+		-- Re-importing a tab replaces its previous contents
+		main:RemoveStashItems(league, tabName)
+		local imported = 0
+		for _, itemData in ipairs(items) do
+			local item = self:ImportItem(itemData, nil, nil, tabName)
+			if item then
+				main:AddStashItem(item, tabName, league)
+				imported = imported + 1
+			end
+		end
+		main:SaveStashItems()
+		self.stashImportStatus = colorCodes.POSITIVE .. "Imported " .. imported .. " of " .. #items .. " items from '" .. tabName .. "' into the Items tab stash list."
+	end)
+end
+
 function ImportTabClass:DownloadSiteCharacterList(realm)
 	function FindMatchingStandardLeague(league)
 		-- Find a Standard league name for a given league name
@@ -960,7 +1146,7 @@ function ImportTabClass:DownloadSiteCharacterList(realm)
 					self.lastAccountHash = common.sha1(accountName)
 					main.lastAccountName = accountName
 					main.gameAccounts[accountName] = main.gameAccounts[accountName] or {}
-					main.gameAccounts[accountName].sessionID = sessionID
+					main.gameAccounts[accountName].sessionID = main.gameAccounts[accountName].sessionID
 					local leagueList = {}
 					for i, char in ipairs(charList) do
 						if not isValueInArray(leagueList, char.league) then
@@ -1439,8 +1625,8 @@ local rarityMap = { [0] = "NORMAL", "MAGIC", "RARE", "UNIQUE", [9] = "RELIC", [1
 local slotMap = { ["Weapon"] = "Weapon 1", ["Offhand"] = "Weapon 2", ["Weapon2"] = "Weapon 1 Swap", ["Offhand2"] = "Weapon 2 Swap", ["Helm"] = "Helmet", ["BodyArmour"] = "Body Armour", ["Gloves"] = "Gloves", ["Boots"] = "Boots", 
 				  ["Amulet"] = "Amulet", ["Ring"] = "Ring 1", ["Ring2"] = "Ring 2", ["Ring3"] = "Ring 3", ["Belt"] = "Belt",  ["BrequelGrafts"] = "Graft 1", ["BrequelGrafts2"] = "Graft 2", }
 
-function ImportTabClass:ImportItem(itemData, slotName, ignoreWeaponSwap)
-	if not slotName then
+function ImportTabClass:ImportItem(itemData, slotName, ignoreWeaponSwap, stashTab)
+	if not slotName and not stashTab then
 		if itemData.inventoryId == "PassiveJewels" then
 			slotName = "Jewel "..self.build.latestTree.jewelSlots[itemData.x + 1]
 		elseif itemData.inventoryId == "Flask" then
@@ -1449,7 +1635,7 @@ function ImportTabClass:ImportItem(itemData, slotName, ignoreWeaponSwap)
 			slotName = slotMap[itemData.inventoryId]
 		end
 	end
-	if not slotName then
+	if not slotName and not stashTab then
 		-- Ignore any items that won't go into known slots
 		return
 	end
@@ -1595,7 +1781,7 @@ function ImportTabClass:ImportItem(itemData, slotName, ignoreWeaponSwap)
 			t_insert(itemData.explicitMods, "Has " .. item.abyssalSocketCount .. " Abyssal Sockets")
 		end
 	end
-	if itemData.socketedItems then
+	if itemData.socketedItems and not stashTab then
 		self:ImportSocketedItems(item, itemData.socketedItems, slotName)
 	end
 	if itemData.requirements and (not itemData.socketedItems or not itemData.socketedItems[1]) then
@@ -1733,7 +1919,10 @@ function ImportTabClass:ImportItem(itemData, slotName, ignoreWeaponSwap)
 	-- Add and equip the new item
 	item:BuildAndParseRaw()
 	--ConPrintf("%s", item.raw)
-	if item.base then
+	if item.base and stashTab then
+		-- Stash items are returned to the caller instead of being added to the build
+		return item
+	elseif item.base then
 		local repIndex, repItem
 		for index, item in pairs(self.build.itemsTab.items) do
 			if item.uniqueID == itemData.id then
@@ -1750,7 +1939,10 @@ function ImportTabClass:ImportItem(itemData, slotName, ignoreWeaponSwap)
 		else
 			self.build.itemsTab:AddItem(item, true)
 		end
-		self.build.itemsTab.slots[slotName]:SetSelItemId(item.id)
+		if slotName then
+			self.build.itemsTab.slots[slotName]:SetSelItemId(item.id)
+		end
+		return item
 	end
 end
 

@@ -151,6 +151,7 @@ function main:Init()
 
 	self.uniqueDB = { list = { }, loading = true }
 	self.rareDB = { list = { }, loading = true }
+	self.stashDB = self.stashDB or { list = { }, revision = 0 }
 
 	local function loadItemDBs()
 		for type, typeList in pairsYield(data.uniques) do
@@ -822,6 +823,69 @@ function main:ChangeUserPath(newUserPath, ignoreBuild)
 	MakeDir(self.buildPath)
 	self:LoadSettings(ignoreBuild)
 	self:LoadSharedItems()
+	self:LoadStashItems()
+end
+
+-- Stash items imported from the Import tab are kept in their own file, shared across builds
+function main:LoadStashItems()
+	self.stashDB = self.stashDB or { list = { }, revision = 0 }
+	wipeTable(self.stashDB.list)
+	self.stashDB.revision = self.stashDB.revision + 1
+	local stashXML, errMsg = common.xml.LoadXMLFile(self.userPath.."StashItems.xml")
+	if not stashXML then
+		if errMsg and not errMsg:match(".*No such file or directory") then
+			ConPrintf("Error loading 'StashItems.xml': %s", errMsg)
+		end
+		return
+	elseif not stashXML[1] or stashXML[1].elem ~= "StashItems" then
+		ConPrintf("Error parsing 'StashItems.xml': 'StashItems' root element missing")
+		return
+	end
+	for _, node in ipairs(stashXML[1]) do
+		if type(node) == "table" and node.elem == "Item" and type(node[1]) == "string" then
+			self:AddStashItem(new("Item", node[1]), node.attrib.tab, node.attrib.league)
+		end
+	end
+end
+
+function main:SaveStashItems()
+	local stashXML = { elem = "StashItems" }
+	for _, item in pairs(self.stashDB.list) do
+		t_insert(stashXML, { elem = "Item", attrib = { tab = item.stashTab, league = item.stashLeague }, item.raw })
+	end
+	local res, errMsg = common.xml.SaveXMLFile(stashXML, self.userPath.."StashItems.xml")
+	if not res then
+		launch:ShowErrMsg("Error saving 'StashItems.xml': %s", errMsg)
+	end
+end
+
+-- Adds an item to the stash library, replacing any existing copy of the same item
+function main:AddStashItem(item, tabName, league)
+	if not item.base then
+		return
+	end
+	item.stashTab = tabName or "?"
+	item.stashLeague = league or "?"
+	local key = item.uniqueID
+	if not key then
+		key = 1
+		while self.stashDB.list[key] do
+			key = key + 1
+		end
+	end
+	item.stashKey = key
+	self.stashDB.list[key] = item
+	self.stashDB.revision = self.stashDB.revision + 1
+end
+
+-- Removes stash items matching the given league and tab (either can be nil to match all)
+function main:RemoveStashItems(league, tabName)
+	for key, item in pairs(self.stashDB.list) do
+		if (not league or item.stashLeague == league) and (not tabName or item.stashTab == tabName) then
+			self.stashDB.list[key] = nil
+		end
+	end
+	self.stashDB.revision = self.stashDB.revision + 1
 end
 --- Opens the popup for the "Options" menu
 --- @param savedState table|nil optional passing of saved values, in case of reopening `{nodePowerTheme, colorPositive, ...}`

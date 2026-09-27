@@ -27,6 +27,9 @@ local ItemDBClass = newClass("ItemDBControl", "ListControl", function(self, anch
 	self.leagueList = { "Any league", "No league" }
 	self.typeList = { "Any type", "Armour", "Jewellery", "One Handed Melee", "Two Handed Melee" }
 	self.slotList = { "Any slot", "Weapon 1", "Weapon 2", "Helmet", "Body Armour", "Gloves", "Boots", "Amulet", "Ring", "Belt", "Jewel", "Flask", "Graft 1", "Graft 2" }
+	if dbType == "STASH" then
+		self.leagueList = { "Any tab" }
+	end
 	local baseY = dbType == "RARE" and -22 or -62
 	self.controls.slot = new("DropDownControl", {"BOTTOMLEFT",self,"TOPLEFT"}, {0, baseY, 179, 18}, self.slotList, function(index, value)
 		self.listBuildFlag = true
@@ -34,19 +37,44 @@ local ItemDBClass = newClass("ItemDBControl", "ListControl", function(self, anch
 	self.controls.type = new("DropDownControl", {"LEFT",self.controls.slot,"RIGHT"}, {2, 0, 179, 18}, self.typeList, function(index, value)
 		self.listBuildFlag = true
 	end)
-	if dbType == "UNIQUE" then
+	if dbType == "UNIQUE" or dbType == "STASH" then
 		self.controls.sort = new("DropDownControl", {"BOTTOMLEFT",self,"TOPLEFT"}, {0, baseY + 20, 179, 18}, self.sortDropList, function(index, value)
 			self:SetSortMode(value.sortMode)
 		end)
+		-- For the stash list this filters by stash tab instead of league
 		self.controls.league = new("DropDownControl", {"LEFT",self.controls.sort,"RIGHT"}, {2, 0, 179, 18}, self.leagueList, function(index, value)
 			self.listBuildFlag = true
 		end)
 		self.controls.requirement = new("DropDownControl", {"LEFT",self.controls.sort,"BOTTOMLEFT"}, {0, 11, 179, 18}, { "Any requirements", "Current level", "Current attributes", "Current useable" }, function(index, value)
 			self.listBuildFlag = true
 		end)
+	end
+	if dbType == "UNIQUE" then
 		self.controls.obtainable = new("DropDownControl", {"LEFT",self.controls.requirement,"RIGHT"}, {2, 0, 179, 18}, { "Obtainable", "Any source", "Unobtainable", "Vendor Recipe", "Upgraded", "Boss Item", "Corruption"}, function(index, value)
 			self.listBuildFlag = true
 		end)
+	elseif dbType == "STASH" then
+		self.controls.removeTab = new("ButtonControl", {"LEFT",self.controls.requirement,"RIGHT"}, {2, 0, 88, 18}, "Remove Tab", function()
+			local tab = self.leagueList[self.controls.league.selIndex]
+			local entry = self.stashTabs[tab]
+			main:OpenConfirmPopup("Remove Stash Tab", "Remove all items from '"..tab.."' from the stash list?", "Remove", function()
+				main:RemoveStashItems(entry.league, entry.tab)
+				main:SaveStashItems()
+			end)
+		end)
+		self.controls.removeTab.enabled = function()
+			return self.controls.league.selIndex > 1
+		end
+		self.controls.removeTab.tooltipText = "Removes the stash tab selected in the tab filter."
+		self.controls.clearAll = new("ButtonControl", {"LEFT",self.controls.removeTab,"RIGHT"}, {3, 0, 88, 18}, "Clear All", function()
+			main:OpenConfirmPopup("Clear Stash List", "Remove all imported stash items?\nThis affects every build.", "Clear", function()
+				main:RemoveStashItems()
+				main:SaveStashItems()
+			end)
+		end)
+		self.controls.clearAll.enabled = function()
+			return next(self.db.list) ~= nil
+		end
 	end
 	self.controls.search = new("EditControl", {"BOTTOMLEFT",self,"TOPLEFT"}, {0, -2, 258, 18}, "", "Search", "%c", 100, function()
 		self.listBuildFlag = true
@@ -57,6 +85,40 @@ local ItemDBClass = newClass("ItemDBControl", "ListControl", function(self, anch
 	self:BuildSortOrder()
 	self.listBuildFlag = true
 end)
+
+-- Rebuilds the tab and type filter lists from the current stash items, keeping the current selections where possible
+function ItemDBClass:LoadStashTabsAndTypes()
+	local selTab = self.leagueList[self.controls.league.selIndex]
+	local selType = self.typeList[self.controls.type.selIndex]
+	self.stashTabs = { }
+	local tabList = { }
+	local typeFlag = { }
+	for _, item in pairs(self.db.list) do
+		local label = item.stashTab .. " (" .. item.stashLeague .. ")"
+		if not self.stashTabs[label] then
+			self.stashTabs[label] = { tab = item.stashTab, league = item.stashLeague }
+			t_insert(tabList, label)
+		end
+		typeFlag[item.type] = true
+	end
+	table.sort(tabList)
+	wipeTable(self.leagueList)
+	t_insert(self.leagueList, "Any tab")
+	for _, label in ipairs(tabList) do
+		t_insert(self.leagueList, label)
+	end
+	for i = #self.typeList, 6, -1 do
+		table.remove(self.typeList, i)
+	end
+	for type in pairsSortByKey(typeFlag) do
+		t_insert(self.typeList, type)
+	end
+	self.controls.league.selIndex = isValueInArray(self.leagueList, selTab) or 1
+	self.controls.type.selIndex = isValueInArray(self.typeList, selType) or 1
+	self.controls.league:CheckDroppedWidth(true)
+	self.stashRevision = self.db.revision
+	self.listBuildFlag = true
+end
 
 function ItemDBClass:LoadLeaguesAndTypes()
 	local leagueFlag = { }
@@ -109,6 +171,12 @@ function ItemDBClass:DoesItemMatchFilters(item)
 			return false
 		end
 	end
+	if self.dbType == "STASH" and self.controls.league.selIndex > 1 then
+		local entry = self.stashTabs[self.leagueList[self.controls.league.selIndex]]
+		if not entry or item.stashTab ~= entry.tab or item.stashLeague ~= entry.league then
+			return false
+		end
+	end
 	if self.dbType == "UNIQUE" and self.controls.obtainable.selIndex ~= 2 then
 		local source = item.source or ""
 		local obtainable = not (source == "No longer obtainable" or (item.league and item.league == "Race Events"))
@@ -124,7 +192,7 @@ function ItemDBClass:DoesItemMatchFilters(item)
 			return false
 		end
 	end
-	if self.dbType == "UNIQUE" and self.controls.requirement.selIndex > 1 then
+	if (self.dbType == "UNIQUE" or self.dbType == "STASH") and self.controls.requirement.selIndex > 1 then
 		if (self.controls.requirement.selIndex == 2 or self.controls.requirement.selIndex == 4) and item.requirements.level and item.requirements.level > self.itemsTab.build.characterLevel then
 			return false
 		end
@@ -305,6 +373,14 @@ function ItemDBClass:Draw(viewPort)
 	end
 	if self.db.loading then
 		self.defaultText = "^7Loading..."
+	elseif self.dbType == "STASH" then
+		-- The stash list changes whenever tabs are imported or removed
+		if self.stashRevision ~= self.db.revision then
+			self:LoadStashTabsAndTypes()
+		end
+		if not next(self.db.list) then
+			self.defaultText = "^7No stash items imported yet.\nUse 'Import Stash Tab' on the Import tab."
+		end
 	elseif not self.leaguesAndTypesLoaded then
 		self:LoadLeaguesAndTypes()
 	end
@@ -313,6 +389,9 @@ end
 
 function ItemDBClass:GetRowValue(column, index, item)
 	if column == 1 then
+		if self.dbType == "STASH" then
+			return colorCodes[item.rarity] .. item.name .. "  ^8[" .. item.stashTab .. "]"
+		end
 		return colorCodes[item.rarity] .. item.name
 	end
 end
@@ -360,6 +439,16 @@ function ItemDBClass:OnSelClick(index, item, doubleClick)
 		self.itemsTab.build.buildFlag = true
 	elseif doubleClick then
 		self.itemsTab:CreateDisplayItemFromRaw(item.raw, true)
+	end
+end
+
+function ItemDBClass:OnSelDelete(index, item)
+	if self.dbType == "STASH" then
+		main.stashDB.list[item.stashKey] = nil
+		main.stashDB.revision = main.stashDB.revision + 1
+		main:SaveStashItems()
+		self.selIndex = nil
+		self.selValue = nil
 	end
 end
 
