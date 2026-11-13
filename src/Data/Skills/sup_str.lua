@@ -4,8 +4,7 @@
 -- Strength support gems
 -- Skill data (c) Grinding Gear Games
 --
-local skills, mod, flag, skill = ...
-
+return function(skills, mod, flag, skill)
 skills["SupportAddedFireDamage"] = {
 	name = "Added Fire Damage",
 	description = "Supports any skill that hits enemies.",
@@ -1537,7 +1536,7 @@ skills["SupportCruelty"] = {
 		},
 	},
 	baseMods = {
-		flag("Cruelty"),
+		flag("Cruelty", { type = "SkillType", skillTypeList = { SkillType.SummonsTotem, SkillType.Trapped, SkillType.RemoteMined }, neg = true }),
 	},
 	qualityStats = {
 		{ "cruelty_effect_+%", 0.25 },
@@ -1607,6 +1606,7 @@ skills["SupportCrystalfall"] = {
 	weaponTypes = {
 		["Claw"] = true,
 		["Dagger"] = true,
+		["Fishing Rod"] = true,
 		["None"] = true,
 		["One Handed Axe"] = true,
 		["One Handed Mace"] = true,
@@ -1659,6 +1659,7 @@ skills["TriggeredSupportCrystalfall"] = {
 	weaponTypes = {
 		["Claw"] = true,
 		["Dagger"] = true,
+		["Fishing Rod"] = true,
 		["None"] = true,
 		["One Handed Axe"] = true,
 		["One Handed Mace"] = true,
@@ -2395,7 +2396,7 @@ skills["SupportFistofWar"] = {
 	support = true,
 	requireSkillTypes = { SkillType.Slam, },
 	addSkillTypes = { },
-	excludeSkillTypes = { SkillType.SummonsTotem, SkillType.Trapped, SkillType.RemoteMined, SkillType.OtherThingUsesSkill, SkillType.Vaal, },
+	excludeSkillTypes = { SkillType.SummonsTotem, SkillType.Trapped, SkillType.RemoteMined, SkillType.OtherThingUsesSkill, SkillType.Vaal, SkillType.Triggered, },
 	ignoreMinionTypes = true,
 	statDescriptionScope = "gem_stat_descriptions",
 	statMap = {
@@ -4689,7 +4690,7 @@ skills["SupportRuthless"] = {
 	support = true,
 	requireSkillTypes = { SkillType.MeleeSingleTarget, SkillType.Slam, },
 	addSkillTypes = { },
-	excludeSkillTypes = { SkillType.Channel, SkillType.NoRuthless, },
+	excludeSkillTypes = { SkillType.Channel, SkillType.NoRuthless, SkillType.Triggered, },
 	statDescriptionScope = "gem_stat_descriptions",
 	statMap = {
 		["support_ruthless_big_hit_stun_base_duration_override_ms"] = {
@@ -5546,3 +5547,4 @@ skills["SupportExpertRetaliation"] = {
 		[40] = { 108, 54, levelRequirement = 100, manaMultiplier = 30, statInterpolation = { 1, 1, }, },
 	},
 }
+end
