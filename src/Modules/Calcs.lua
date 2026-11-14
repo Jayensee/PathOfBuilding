@@ -40,8 +40,19 @@ end
 local function powerMetricCalc(env)
 	local output = env.player.output
 	local reciprocal_sum = 0.0
+	-- Net sustain can be zero or negative (e.g. degen bigger than regen + leech), which would make the cube root
+	-- below NaN/0. Below this threshold the value is mapped smoothly onto (0, threshold) as k^2 / (2k - x):
+	-- it stays positive and keeps increasing with sustain, so regen is still valued when negative.
+	local sustainThreshold = 100
 	for _, damageType in ipairs(dmgTypeList) do
-		reciprocal_sum = reciprocal_sum + 1 / output[damageType.."IgnoreableDot"]
+		-- Immune to this DoT type: it never needs to be ignored
+		if (output[damageType.."TakenDotMult"] or 1) > 0 then
+			local ignoreable = output[damageType.."IgnoreableDot"] or 0
+			if ignoreable < sustainThreshold then
+				ignoreable = sustainThreshold ^ 2 / (2 * sustainThreshold - ignoreable)
+			end
+			reciprocal_sum = reciprocal_sum + 1 / ignoreable
+		end
 	end
 	local aoe_mod = 1.0
 	if type(output.AreaOfEffectMod) == "number" then
@@ -52,7 +63,11 @@ local function powerMetricCalc(env)
 		speed = output.Speed
 	end
 	local tank_metric = ((1/(1/output.EffectiveMaximumHitTaken + 1/output.TotalEHP) ^ 2 * 5 / reciprocal_sum ) ^ (1/3))
+	-- Use Full DPS when skills are added to it, otherwise fall back to the selected main skill (same as the Full DPS sort)
 	local damage_metric = output.FullDPS
+	if not damage_metric or not (output.SkillDPS and #output.SkillDPS > 0) then
+		damage_metric = (output.CombinedDPS or 0) + (output.Minion and output.Minion.CombinedDPS or 0)
+	end
 	local utility_metric = (aoe_mod * (speed^4 or 1)) ^ (1/5)
 	return tank_metric * damage_metric * utility_metric  / 1000
 end
@@ -119,10 +134,9 @@ function calcs.getMiscCalculator(build)
 		env.player.output.SkillDPS = fullDPS.skills
 		env.player.output.FullDPS = fullDPS.combinedDPS
 		env.player.output.FullDotDPS = fullDPS.TotalDotDPS
-		
-		env.player.output.PowerMetric = powerMetricCalc(env)
-
 	end
+	-- Always set, even without Full DPS skills, so sorting by Power Metric doesn't give every item 0
+	env.player.output.PowerMetric = powerMetricCalc(env)
 	return function(override, useFullDPS)
 		local env, cachedPlayerDB, cachedEnemyDB, cachedMinionDB = calcs.initEnv(build, "CALCULATOR", override)
 		-- Trigger-source calculations shared by this override's main and Full DPS passes
@@ -134,16 +148,15 @@ function calcs.getMiscCalculator(build)
 			env.triggerSourceCache[mainUUID] = mainEntry
 		end
 		if (useFullDPS ~= false or build.viewMode == "TREE") and usedFullDPS then
-			-- prevent upcoming calculation from using Cached Data and thus forcing it to re-calculate new FullDPS roll-up 
+			-- prevent upcoming calculation from using Cached Data and thus forcing it to re-calculate new FullDPS roll-up
 			-- without this, FullDPS increase/decrease when for node/item/gem comparison would be all 0 as it would be comparing
 			-- A with A (due to cache reuse) instead of A with B
 			local fullDPS = calcs.calcFullDPS(build, "CALCULATOR", override, { cachedPlayerDB = cachedPlayerDB, cachedEnemyDB = cachedEnemyDB, cachedMinionDB = cachedMinionDB, env = nil, triggerSourceCache = env.triggerSourceCache })
 			env.player.output.SkillDPS = fullDPS.skills
 			env.player.output.FullDPS = fullDPS.combinedDPS
 			env.player.output.FullDotDPS = fullDPS.TotalDotDPS
-			
-			env.player.output.PowerMetric = powerMetricCalc(env)
 		end
+		env.player.output.PowerMetric = powerMetricCalc(env)
 		return env.player.output
 	end, env.player.output
 end
@@ -441,10 +454,8 @@ function calcs.buildOutput(build, mode)
 	env.player.output.SkillDPS = fullDPS.skills
 	env.player.output.FullDPS = fullDPS.combinedDPS
 	env.player.output.FullDotDPS = fullDPS.TotalDotDPS
-	
-	for _, damageType in ipairs(dmgTypeList) do
-		reciprocal_sum = reciprocal_sum + 1 / output[damageType.."IgnoreableDot"]
-	end
+	local output = env.player.output
+
 	env.player.output.PowerMetric = powerMetricCalc(env)
 
 	if mode == "MAIN" then
