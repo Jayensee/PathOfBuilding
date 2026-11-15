@@ -7908,6 +7908,7 @@ skills["FlickerStrike"] = {
 	description = "Teleports the character to a nearby monster and attacks with a melee weapon. If no specific monster is targeted, one is picked at random. Grants a buff that increases movement speed for a duration. The cooldown can be bypassed by expending a Frenzy Charge.",
 	skillTypes = { [SkillType.Attack] = true, [SkillType.Melee] = true, [SkillType.MeleeSingleTarget] = true, [SkillType.Multistrikeable] = true, [SkillType.Movement] = true, [SkillType.Duration] = true, [SkillType.Cooldown] = true, },
 	weaponTypes = {
+		["None"] = true,
 		["Claw"] = true,
 		["Dagger"] = true,
 		["One Handed Axe"] = true,
@@ -7999,6 +8000,7 @@ skills["FlickerStrikeAltX"] = {
 	description = "Teleports the character to a nearby monster and attacks with a melee weapon. If no specific monster is targeted, one is picked at random. Grants a buff that increases movement speed for a duration. The cooldown can be bypassed by expending a Power Charge.",
 	skillTypes = { [SkillType.Attack] = true, [SkillType.Melee] = true, [SkillType.MeleeSingleTarget] = true, [SkillType.Multistrikeable] = true, [SkillType.Movement] = true, [SkillType.Duration] = true, [SkillType.Cooldown] = true, },
 	weaponTypes = {
+		["None"] = true,
 		["Claw"] = true,
 		["Dagger"] = true,
 		["One Handed Axe"] = true,
@@ -8090,6 +8092,7 @@ skills["VaalFlickerStrike"] = {
 	description = "Repeatedly teleports to enemies and hits them, inflicting a wound but dealing no damage. After the repeating finishes, each enemy is hit by the total damage of their wounds, which are removed.",
 	skillTypes = { [SkillType.Attack] = true, [SkillType.Melee] = true, [SkillType.MeleeSingleTarget] = true, [SkillType.Movement] = true, [SkillType.Vaal] = true, [SkillType.NeverExertable] = true, },
 	weaponTypes = {
+		["None"] = true,
 		["Claw"] = true,
 		["Dagger"] = true,
 		["One Handed Axe"] = true,
