@@ -191,11 +191,17 @@ function TreeTabClass:TreeTab(build)
 		self:FindTimelessJewel()
 	end)
 
+	-- Tree Optimizer Button
+	self.controls.optimizeTree = new("ButtonControl"):ButtonControl({ "LEFT", self.controls.findTimelessJewel, "RIGHT" }, { 8, 0, 110, 20 }, "Optimize Tree", function()
+		self:OpenOptimizerPopup()
+	end)
+	self.controls.optimizeTree.tooltipText = "Search for the tree that maximises a stat (Power Metric by default) with the same number of points.\nAlt+Left click nodes to mark them as must-have, Alt+Right click for must-not-have."
+
 	--Default index for Tattoos
 	self.defaultTattoo = { }
 
 	-- Show Node Power Checkbox
-	self.controls.treeHeatMap = new("CheckBoxControl"):CheckBoxControl({ "LEFT", self.controls.findTimelessJewel, "RIGHT" }, { 130, 0, 20 }, "Show Node Power:", function(state)
+	self.controls.treeHeatMap = new("CheckBoxControl"):CheckBoxControl({ "LEFT", self.controls.optimizeTree, "RIGHT" }, { 130, 0, 20 }, "Show Node Power:", function(state)
 		self.viewer.showHeatMap = state
 		self.controls.treeHeatMapStatSelect.shown = state
 		if not self.build.calcsTab.powerStat then
@@ -362,6 +368,8 @@ function TreeTabClass:Draw(viewPort, inputEvents)
 	self.anchorControls.x = viewPort.x + 4
 	self.anchorControls.y = viewPort.y + viewPort.height - 24
 
+	self:ResumeOptimizer()
+
 	for id, event in ipairs(inputEvents) do
 		if event.type == "KeyDown" then
 			if event.key == "z" and IsKeyDown("CTRL") then
@@ -405,6 +413,7 @@ function TreeTabClass:Draw(viewPort, inputEvents)
 	
 	local widthSecondLineControls = self.controls.treeSearch.width + 8
 									+ self.controls.findTimelessJewel.width + self.controls.findTimelessJewel.x
+									+ self.controls.optimizeTree.width + self.controls.optimizeTree.x
 									+ self.controls.treeHeatMap.width + 130
 									+ self.controls.nodePowerMaxDepthSelect.width + self.controls.nodePowerMaxDepthSelect.x
 									+ (self.isCustomMaxDepth and (self.controls.nodePowerMaxDepthCustom.width + self.controls.nodePowerMaxDepthCustom.x) or 0)
@@ -423,7 +432,7 @@ function TreeTabClass:Draw(viewPort, inputEvents)
 
 	-- Check second line
 	if viewPort.width >= widthSecondLineControls + rightMargin then
-		self.controls.treeHeatMap:SetAnchor("LEFT", self.controls.findTimelessJewel, "RIGHT", 130, 0)
+		self.controls.treeHeatMap:SetAnchor("LEFT", self.controls.optimizeTree, "RIGHT", 130, 0)
 	else
 		linesHeight = linesHeight * 2
 		self.controls.treeHeatMap:SetAnchor("TOPLEFT", self.controls.treeSearch, "BOTTOMLEFT", 124, 4)
@@ -2876,4 +2885,332 @@ function TreeTabClass:FindTimelessJewel()
 	-- so the panel grows by a row for every row the settings column gains
 	local panelHeight = 565 + rowSpacing + rowHeight
 	main:OpenPopup(panelWidth, panelHeight, "Find a Timeless Jewel", controls)
+end
+
+-- Tree Optimizer
+
+-- Toggles a Tree Optimizer mark ("must" or "not") on a node of the active spec
+function TreeTabClass:ToggleOptimizerMark(node, mark)
+	if node.ascendancyName or node.type == "ClassStart" or node.type == "AscendClassStart" then
+		return
+	end
+	local marks = self.build.spec.optimizerMarks
+	if marks[node.id] == mark then
+		marks[node.id] = nil
+	else
+		marks[node.id] = mark
+	end
+	self.modFlag = true
+end
+
+local function formatOptimizerValue(value)
+	if m_abs(value) >= 1000 then
+		return formatNumSep(s_format("%.0f", value))
+	end
+	return s_format("%.2f", value)
+end
+
+local function formatOptimizerChange(new, old)
+	if old == 0 then
+		return ""
+	end
+	local change = (new / old - 1) * 100
+	return s_format(" (%s%+.1f%%^7)", change >= 0 and colorCodes.POSITIVE or colorCodes.NEGATIVE, change)
+end
+
+function TreeTabClass:StartOptimizer()
+	local spec = self.build.spec
+	local settings = self.optimizerSettings
+	local mustHave, mustNot = { }, { }
+	for nodeId, mark in pairs(spec.optimizerMarks) do
+		if spec.nodes[nodeId] then
+			if mark == "must" then
+				mustHave[nodeId] = true
+			else
+				mustNot[nodeId] = true
+			end
+		end
+	end
+	local run = { spec = spec }
+	local lastYield = GetTime()
+	local TreeOptimizer = LoadModule("Modules/TreeOptimizer")
+	run.optimizer = TreeOptimizer.new(self.build, {
+		mustHave = mustHave,
+		mustNot = mustNot,
+		points = settings.points,
+		requirements = copyTable(spec.optimizerRequirements),
+		fromScratch = settings.fromScratch,
+		powerStat = settings.powerStat,
+		timeLimit = settings.timeLimit,
+		onProgress = function(info)
+			run.info = info
+			-- Hand control back to the UI regularly, like the power report builder
+			if GetTime() - lastYield > 80 then
+				coroutine.yield()
+				lastYield = GetTime()
+			end
+		end,
+		shouldStop = function()
+			return run.stopRequested
+		end,
+	})
+	run.co = coroutine.create(function()
+		return run.optimizer:Run()
+	end)
+	self.optimizerRun = run
+end
+
+-- Advances a running optimization; called every frame from Draw
+function TreeTabClass:ResumeOptimizer()
+	local run = self.optimizerRun
+	if not run or not run.co then
+		return
+	end
+	if run.spec ~= self.build.spec then
+		-- The active tree changed underneath the run, so its results no longer apply
+		self.optimizerRun = nil
+		return
+	end
+	local ok, result = coroutine.resume(run.co)
+	if not ok then
+		run.co = nil
+		run.error = tostring(result)
+		ConPrintf("Tree Optimizer error: %s", run.error)
+		return
+	end
+	if coroutine.status(run.co) == "dead" then
+		run.co = nil
+		if result.error then
+			run.error = result.error
+		else
+			run.result = result
+			run.added, run.removed = run.optimizer:Diff(result.best)
+		end
+	end
+end
+
+function TreeTabClass:OpenOptimizerPopup()
+	local build = self.build
+	local spec = build.spec
+	local output = build.calcsTab.mainOutput
+	self.optimizerRun = nil
+	self.optimizerSettings = self.optimizerSettings or { timeLimit = 60, fromScratch = false }
+	local settings = self.optimizerSettings
+
+	local statList = { }
+	for _, stat in ipairs(self.powerStatList) do
+		if stat.stat then
+			t_insert(statList, stat)
+		end
+	end
+	settings.powerStat = settings.powerStat or statList[1]
+
+	local function isRunning()
+		return self.optimizerRun and self.optimizerRun.co ~= nil
+	end
+	local function notRunning()
+		return not isRunning()
+	end
+
+	local controls = { }
+	local popupWidth = 640
+	local labelX, fieldX = 190, 198
+
+	-- Marked nodes
+	controls.marks = new("LabelControl"):LabelControl({ "TOPLEFT", nil, "TOPLEFT" }, { 16, 26, 0, 16 }, function()
+		local must, mustNot = 0, 0
+		for _, mark in pairs(spec.optimizerMarks) do
+			if mark == "must" then
+				must = must + 1
+			else
+				mustNot = mustNot + 1
+			end
+		end
+		return s_format("^7Marked nodes: %s%d must-have^7, %s%d must-not-have", colorCodes.POSITIVE, must, colorCodes.NEGATIVE, mustNot)
+	end)
+	controls.clearMarks = new("ButtonControl"):ButtonControl({ "TOPRIGHT", nil, "TOPRIGHT" }, { -16, 24, 100, 20 }, "Clear Marks", function()
+		wipeTable(spec.optimizerMarks)
+		self.modFlag = true
+	end)
+	controls.clearMarks.enabled = function()
+		return notRunning() and next(spec.optimizerMarks) ~= nil
+	end
+	controls.marksHint = new("LabelControl"):LabelControl({ "TOPLEFT", nil, "TOPLEFT" }, { 16, 46, 0, 14 }, "^8Close this window and Alt+Left click nodes to mark them as must-have, Alt+Right click for must-not-have.")
+
+	-- Settings
+	controls.statLabel = new("LabelControl"):LabelControl({ "TOPRIGHT", nil, "TOPLEFT" }, { labelX, 76, 0, 16 }, "^7Maximise:")
+	controls.stat = new("DropDownControl"):DropDownControl({ "TOPLEFT", nil, "TOPLEFT" }, { fieldX, 74, 220, 20 }, statList, function(index, value)
+		settings.powerStat = value
+	end)
+	controls.stat:SelByValue(settings.powerStat.stat, "stat")
+	controls.stat.enabled = notRunning
+
+	controls.startLabel = new("LabelControl"):LabelControl({ "TOPRIGHT", nil, "TOPLEFT" }, { labelX, 102, 0, 16 }, "^7Start from:")
+	controls.start = new("DropDownControl"):DropDownControl({ "TOPLEFT", nil, "TOPLEFT" }, { fieldX, 100, 220, 20 }, { "Current tree", "Class start (keeps must-haves)" }, function(index)
+		settings.fromScratch = index == 2
+	end)
+	controls.start:SetSel(settings.fromScratch and 2 or 1)
+	controls.start.enabled = notRunning
+	controls.start.tooltipText = "Improving the current tree is faster and usually finds better trees.\nStarting from the class start works best with the key nodes of the build marked as must-have."
+
+	local usedPoints = spec:CountAllocNodes()
+	controls.pointsLabel = new("LabelControl"):LabelControl({ "TOPRIGHT", nil, "TOPLEFT" }, { labelX, 128, 0, 16 }, "^7Passive points:")
+	controls.points = new("EditControl"):EditControl({ "TOPLEFT", nil, "TOPLEFT" }, { fieldX, 126, 70, 20 }, settings.points and tostring(settings.points) or "", nil, "%D", 3, function(buf)
+		settings.points = tonumber(buf)
+	end)
+	controls.points:SetPlaceholder(tostring(usedPoints))
+	controls.points.enabled = notRunning
+	controls.points.tooltipText = "Leave blank to use the number of points in the current tree."
+
+	controls.timeLabel = new("LabelControl"):LabelControl({ "TOPRIGHT", nil, "TOPLEFT" }, { labelX, 154, 0, 16 }, "^7Time limit (seconds):")
+	controls.time = new("EditControl"):EditControl({ "TOPLEFT", nil, "TOPLEFT" }, { fieldX, 152, 70, 20 }, tostring(settings.timeLimit), nil, "%D", 4, function(buf)
+		settings.timeLimit = m_max(tonumber(buf) or 60, 5)
+	end)
+	controls.time.enabled = notRunning
+	controls.time.tooltipText = "Longer runs explore more trees. The optimizer can be stopped at any time and keeps the best tree found so far."
+
+	controls.attrLabel = new("LabelControl"):LabelControl({ "TOPRIGHT", nil, "TOPLEFT" }, { labelX, 180, 0, 16 }, "^7Attribute requirements:")
+	for i, attr in ipairs({ "Str", "Dex", "Int" }) do
+		local key = "attr" .. attr
+		controls[key] = new("EditControl"):EditControl({ "TOPLEFT", nil, "TOPLEFT" }, { fieldX + (i - 1) * 108, 178, 100, 20 }, spec.optimizerRequirements[attr] and tostring(spec.optimizerRequirements[attr]) or "", attr, "%D", 4, function(buf)
+			spec.optimizerRequirements[attr] = tonumber(buf)
+			self.modFlag = true
+		end)
+		controls[key]:SetPlaceholder(tostring(output["Req" .. attr] or 0))
+		controls[key].enabled = notRunning
+		controls[key].tooltipText = "Leave blank to use the requirement from your gear and gems (shown in grey)."
+	end
+	controls.manaLabel = new("LabelControl"):LabelControl({ "TOPRIGHT", nil, "TOPLEFT" }, { labelX, 206, 0, 16 }, "^7Min. unreserved mana:")
+	controls.mana = new("EditControl"):EditControl({ "TOPLEFT", nil, "TOPLEFT" }, { fieldX, 204, 70, 20 }, spec.optimizerRequirements.ManaUnreserved and tostring(spec.optimizerRequirements.ManaUnreserved) or "", nil, "%D", 5, function(buf)
+		spec.optimizerRequirements.ManaUnreserved = tonumber(buf)
+		self.modFlag = true
+	end)
+	controls.mana:SetPlaceholder("0")
+	controls.mana.enabled = notRunning
+	controls.mana.tooltipText = "The optimized tree must leave at least this much mana unreserved.\nYour current tree has " .. formatNumSep(tostring(m_floor(output.ManaUnreserved or 0))) .. " unreserved mana."
+	local TreeOptimizer = LoadModule("Modules/TreeOptimizer")
+	local function sustainSummary()
+		local mainSkill = build.calcsTab.mainEnv and build.calcsTab.mainEnv.player.mainSkill
+		local name = mainSkill and mainSkill.activeEffect and mainSkill.activeEffect.grantedEffect.name or "the main skill"
+		if not TreeOptimizer.MainSkillUsedContinuously(build) then
+			return "^7" .. name .. " is a summon, totem or brand, so this check doesn't apply to it."
+		end
+		local shortfalls = TreeOptimizer.SustainShortfalls(output)
+		if shortfalls[1] then
+			local s = shortfalls[1]
+			return s_format("%sYour current tree can't sustain %s: it costs %.1f %s/s, recovering %.1f/s.", colorCodes.NEGATIVE, name, s.cost, s.label, s.recovery)
+		end
+		return "^7Your current tree sustains " .. name .. "."
+	end
+	controls.sustain = new("CheckBoxControl"):CheckBoxControl({ "TOPLEFT", nil, "TOPLEFT" }, { fieldX, 230, 20 }, "^7Sustain main skill cost:", function(state)
+		spec.optimizerRequirements.SustainCost = not state and 0 or nil
+		self.modFlag = true
+	end, nil, spec.optimizerRequirements.SustainCost ~= 0)
+	controls.sustain.enabled = notRunning
+	controls.sustain.tooltipFunc = function(tooltip)
+		tooltip:Clear()
+		tooltip:AddLine(16, "^7Requires mana regeneration, leech and gain on hit to keep up with the main skill's")
+		tooltip:AddLine(16, "^7cost per second while it's used non-stop (energy shield and life too, for skills that cost them).")
+		tooltip:AddLine(16, "^7Flasks and recovery on kill are not counted.")
+		tooltip:AddLine(16, sustainSummary())
+	end
+	controls.constraintHint = new("LabelControl"):LabelControl({ "TOPLEFT", nil, "TOPLEFT" }, { fieldX, 256, 0, 14 }, "^8Unreserved life must stay above 0 and skill costs must stay payable.")
+
+	-- Status
+	controls.status = new("LabelControl"):LabelControl({ "TOPLEFT", nil, "TOPLEFT" }, { 16, 284, 0, 16 }, function()
+		local run = self.optimizerRun
+		local statLabel = settings.powerStat.label
+		if not run then
+			return s_format("^7Current %s: %s", statLabel, formatOptimizerValue(data.powerStatList.GetFromOutput(output, settings.powerStat)))
+		elseif run.error then
+			return colorCodes.NEGATIVE .. run.error
+		end
+		local optimizer = run.optimizer
+		local initial = optimizer.initialEval
+		if run.co then
+			local info = run.info or { }
+			local best = info.best
+			return s_format("^7Running (%s): %d trees evaluated, %ds / %ds%s", info.phase or "starting", info.evals or 0, info.elapsed or 0, settings.timeLimit,
+				(best and initial) and (" - best " .. formatOptimizerValue(best.value) .. formatOptimizerChange(best.value, initial.value)) or "")
+		end
+		local result = run.result
+		return s_format("^7%s %s: %s -> %s%s", result.stopped and "Stopped." or "Done.", statLabel, formatOptimizerValue(result.initialEval.value),
+			formatOptimizerValue(result.bestEval.value), formatOptimizerChange(result.bestEval.value, result.initialEval.value))
+	end)
+	controls.details = new("LabelControl"):LabelControl({ "TOPLEFT", nil, "TOPLEFT" }, { 16, 304, 0, 16 }, function()
+		local run = self.optimizerRun
+		if not run or not run.result then
+			return ""
+		end
+		local result = run.result
+		local text = s_format("^7%d trees evaluated in %ds. %d nodes changed. ", result.evals, result.time, #run.added)
+		if result.bestEval.deficit > 0 then
+			return text .. colorCodes.NEGATIVE .. "Requirements not met: " .. (result.bestEval.violations[1] or "attributes")
+		end
+		return text .. colorCodes.POSITIVE .. "All requirements met."
+	end)
+
+	-- Buttons
+	controls.run = new("ButtonControl"):ButtonControl({ "BOTTOM", nil, "BOTTOM" }, { -165, -12, 150, 20 }, function()
+		return isRunning() and "Stop" or "Run Optimizer"
+	end, function()
+		if isRunning() then
+			self.optimizerRun.stopRequested = true
+		else
+			self:StartOptimizer()
+		end
+	end)
+	controls.apply = new("ButtonControl"):ButtonControl({ "BOTTOM", nil, "BOTTOM" }, { 0, -12, 150, 20 }, "Apply as New Tree", function()
+		local run = self.optimizerRun
+		run.optimizer:ApplyToNewSpec(run.result.best, (spec.title or "Default") .. " (optimized)")
+		self.optimizerRun = nil
+		self.modFlag = true
+		build.modFlag = true
+		main:ClosePopup()
+	end)
+	controls.apply.enabled = function()
+		return notRunning() and self.optimizerRun ~= nil and self.optimizerRun.result ~= nil
+	end
+	controls.apply.tooltipFunc = function(tooltip)
+		tooltip:Clear()
+		local run = self.optimizerRun
+		if not run or not run.result then
+			return
+		end
+		tooltip:AddLine(16, "^7Adds the optimized tree to this build's tree list and switches to it.")
+		tooltip:AddLine(16, "^7Your current tree is kept unchanged.")
+		local function addNodeList(title, list, color)
+			local names, normal = { }, 0
+			for _, entry in ipairs(list) do
+				local node = entry.node
+				if node and node.type ~= "Normal" then
+					local name = node.dn or node.name or tostring(entry.id)
+					if entry.effectId and spec.tree.masteryEffects[entry.effectId] then
+						name = name .. ": " .. t_concat(spec.tree.masteryEffects[entry.effectId].sd, " / ")
+					end
+					t_insert(names, name)
+				else
+					normal = normal + 1
+				end
+			end
+			t_sort(names)
+			tooltip:AddSeparator(10)
+			tooltip:AddLine(16, s_format("%s%s %d nodes:", color, title, #list))
+			for _, name in ipairs(names) do
+				tooltip:AddLine(14, "^7  " .. name)
+			end
+			if normal > 0 then
+				tooltip:AddLine(14, s_format("^8  ... and %d small passives", normal))
+			end
+		end
+		addNodeList("Allocates", run.added, colorCodes.POSITIVE)
+		addNodeList("Removes", run.removed, colorCodes.NEGATIVE)
+	end
+	controls.close = new("ButtonControl"):ButtonControl({ "BOTTOM", nil, "BOTTOM" }, { 165, -12, 150, 20 }, "Close", function()
+		-- Closing discards the run; the tree may be edited afterwards, which would make its results stale
+		self.optimizerRun = nil
+		main:ClosePopup()
+	end)
+
+	main:OpenPopup(popupWidth, 364, "Tree Optimizer", controls, nil, nil, "close")
 end

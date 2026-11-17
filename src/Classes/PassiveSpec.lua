@@ -98,10 +98,25 @@ function PassiveSpecClass:Init(treeVersion, convert)
 
 	-- Cluster hash format version used by saved builds; 2 is current.
 	self.clusterHashFormatVersion = 2
+
+	-- Tree Optimizer constraints. Kept across tree version changes, which re-run Init.
+	-- Keys are node IDs, values are "must" (must-have) or "not" (must-not-have)
+	self.optimizerMarks = self.optimizerMarks or { }
+	-- Manual requirements: attributes (Str, Dex, Int, Omni) override the calculated requirement,
+	-- ManaUnreserved is the minimum unreserved mana. e.g. { Str = 120, ManaUnreserved = 50 }
+	self.optimizerRequirements = self.optimizerRequirements or { }
 end
 
 function PassiveSpecClass:Load(xml, dbFileName)
 	self.title = xml.attrib.title
+	for attrib, mark in pairs({ optimizerMustHave = "must", optimizerMustNot = "not" }) do
+		for id in (xml.attrib[attrib] or ""):gmatch("%d+") do
+			self.optimizerMarks[tonumber(id)] = mark
+		end
+	end
+	for key, value in (xml.attrib.optimizerRequirements or ""):gmatch("(%a+)=(%d+)") do
+		self.optimizerRequirements[key] = tonumber(value)
+	end
 	-- Specs without this attribute predate the hash-fix migration and are treated as legacy.
 	self.clusterHashFormatVersion = tonumber(xml.attrib.clusterHashFormatVersion) or (xml.attrib.nodes and 1 or 2)
 	local url
@@ -220,6 +235,25 @@ function PassiveSpecClass:Save(xml)
 		nodes = table.concat(allocNodeIdList, ","),
 		masteryEffects = table.concat(masterySelections, ",")
 	}
+	local optimizerMarkLists = { must = { }, ["not"] = { } }
+	for nodeId, mark in pairs(self.optimizerMarks) do
+		t_insert(optimizerMarkLists[mark], nodeId)
+	end
+	for attrib, mark in pairs({ optimizerMustHave = "must", optimizerMustNot = "not" }) do
+		if optimizerMarkLists[mark][1] then
+			table.sort(optimizerMarkLists[mark])
+			xml.attrib[attrib] = table.concat(optimizerMarkLists[mark], ",")
+		end
+	end
+	local optimizerRequirements = { }
+	for _, key in ipairs({ "Str", "Dex", "Int", "Omni", "ManaUnreserved", "SustainCost" }) do
+		if self.optimizerRequirements[key] then
+			t_insert(optimizerRequirements, key .. "=" .. self.optimizerRequirements[key])
+		end
+	end
+	if optimizerRequirements[1] then
+		xml.attrib.optimizerRequirements = table.concat(optimizerRequirements, ",")
+	end
 	t_insert(xml, {
 		-- Legacy format
 		elem = "URL",

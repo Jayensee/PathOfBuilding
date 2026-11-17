@@ -388,6 +388,14 @@ function PassiveTreeViewClass:Draw(build, viewPort, inputEvents)
 	-- Split Personality highlight
 	local splitPersonalityPath = spec.splitPersonalityPath or { }
 
+	-- Alt-click marks nodes for the Tree Optimizer instead of allocating them
+	if treeClick and IsKeyDown("ALT") then
+		if hoverNode and build.treeTab and build.treeTab.ToggleOptimizerMark then
+			build.treeTab:ToggleOptimizerMark(hoverNode, treeClick == "LEFT" and "must" or "not")
+		end
+		treeClick = nil
+	end
+
 	if treeClick == "LEFT" then
 		if hoverNode then
 			-- User left-clicked on a node
@@ -1044,11 +1052,24 @@ function PassiveTreeViewClass:Draw(build, viewPort, inputEvents)
 			end
 
 		end
+		local optimizerMark = spec.optimizerMarks and spec.optimizerMarks[nodeId]
+		if optimizerMark then
+			-- Tree Optimizer must-have / must-not-have ring, drawn larger than the search ring so both stay visible
+			SetDrawLayer(nil, 30)
+			if optimizerMark == "must" then
+				SetDrawColor(0.2, 1, 0.2)
+			else
+				SetDrawColor(1, 0.2, 1)
+			end
+			local size = 210 * scale / self.zoom ^ 0.4
+			DrawImage(self.highlightRing, scrX - size, scrY - size, size * 2, size * 2)
+			SetDrawColor(1, 1, 1)
+		end
 		if node == hoverNode and (node.type ~= "Socket" or not IsKeyDown("SHIFT")) and (node.type ~= "Mastery" or node.masteryEffects) and not IsKeyDown("CTRL") and not main.popups[1] then
 			-- Draw tooltip
 			SetDrawLayer(nil, 100)
 			local size = m_floor(node.size * scale)
-			if self.tooltip:CheckForUpdate(node, self.showStatDifferences, self.tracePath, launch.devModeAlt, build.outputRevision, build.spec.allocMode) then
+			if self.tooltip:CheckForUpdate(node, self.showStatDifferences, self.tracePath, launch.devModeAlt, build.outputRevision, build.spec.allocMode, optimizerMark) then
 				self:AddNodeTooltip(self.tooltip, node, build)
 			end
 			self.tooltip.center = true
@@ -1517,6 +1538,7 @@ function PassiveTreeViewClass:AddNodeTooltip(tooltip, node, build, returnEarly)
 		if socket:IsEnabled() then
 			tooltip:AddLine(14, colorCodes.TIP.."Tip: Right click this socket to go to the items page and choose the jewel for this socket.")
 		end
+		self:AddOptimizerMarkTooltip(tooltip, node, build)
 		tooltip:AddLine(14, colorCodes.TIP.."Tip: Hold Shift or Ctrl to hide this tooltip.")
 		return
 	end
@@ -1761,11 +1783,30 @@ function PassiveTreeViewClass:AddNodeTooltip(tooltip, node, build, returnEarly)
 		tooltip:AddLine(14, "^xFFD700"..formatNumSep(#node.depends * goldCost) .. " Gold ^7required to unallocate this node")
 		tooltip:AddLine(14, colorCodes.TIP)
 	end
+	self:AddOptimizerMarkTooltip(tooltip, node, build)
 	if node.type == "Socket" then
 		tooltip:AddLine(14, colorCodes.TIP.."Tip: Hold Shift or Ctrl to hide this tooltip.")
 	else
 		tooltip:AddLine(14, colorCodes.TIP.."Tip: Hold Ctrl to hide this tooltip.")
 		tooltip:AddLine(14, colorCodes.TIP.."Tip: Press Ctrl+C to copy this node's text.")
+	end
+end
+
+function PassiveTreeViewClass:AddOptimizerMarkTooltip(tooltip, node, build)
+	if node.ascendancyName or node.type == "ClassStart" or node.type == "AscendClassStart" then
+		return
+	end
+	local marks = build.spec and build.spec.optimizerMarks
+	if not marks then
+		return
+	end
+	local mark = marks[node.id]
+	if mark == "must" then
+		tooltip:AddLine(14, colorCodes.POSITIVE.."Tree Optimizer: must-have ^7(Alt+Left click to clear)")
+	elseif mark == "not" then
+		tooltip:AddLine(14, colorCodes.NEGATIVE.."Tree Optimizer: must-not-have ^7(Alt+Right click to clear)")
+	else
+		tooltip:AddLine(14, colorCodes.TIP.."Tip: Alt+Left/Right click to mark as must-have/must-not-have for the Tree Optimizer.")
 	end
 end
 

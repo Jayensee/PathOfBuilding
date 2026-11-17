@@ -1,0 +1,388 @@
+describe("TreeOptimizer", function()
+	local TreeOptimizer
+	local lifeStat = { stat = "Life", label = "Life" }
+
+	before_each(function()
+		newBuild()
+		TreeOptimizer = LoadModule("Modules/TreeOptimizer")
+	end)
+
+	local function run(options)
+		options.powerStat = options.powerStat or lifeStat
+		options.timeLimit = options.timeLimit or 5
+		options.maxEvals = options.maxEvals or 400
+		local optimizer = TreeOptimizer.new(build, options)
+		local result = optimizer:Run()
+		assert.is_nil(result.error)
+		return optimizer, result
+	end
+
+	local function assertConnected(optimizer, state)
+		local reached = optimizer:Reachable(state.nodes)
+		for id in pairs(state.nodes) do
+			assert.is_true(reached[id] == true, "node " .. id .. " is not connected to the class start")
+		end
+	end
+
+	-- Closest unallocated notable at least `minDist` points away
+	local function findNotable(minDist)
+		local best
+		for _, node in pairs(build.spec.nodes) do
+			if node.type == "Notable" and not node.ascendancyName and node.pathDist and node.pathDist >= minDist and node.pathDist < 1000 then
+				if not best or node.pathDist < best.pathDist then
+					best = node
+				end
+			end
+		end
+		return best
+	end
+
+	it("fills the budget with a connected tree that improves the stat", function()
+		local optimizer, result = run({ points = 12, fromScratch = true })
+		assert.is_true(result.best.count <= 12)
+		assert.is_true(result.best.count > 0)
+		assert.is_true(result.bestEval.value > result.initialEval.value)
+		assertConnected(optimizer, result.best)
+	end)
+
+	it("keeps must-have nodes and avoids must-not nodes", function()
+		local mustHave = assert(findNotable(5))
+		local optimizer, result = run({ points = 12, fromScratch = true, mustHave = { [mustHave.id] = true } })
+		assert.is_truthy(result.best.nodes[mustHave.id])
+		assertConnected(optimizer, result.best)
+
+		-- Ban everything the unconstrained tree took (except the must-have path) and check none of it comes back
+		local mustNot = { }
+		for id in pairs(result.best.nodes) do
+			if id ~= mustHave.id and build.spec.nodes[id].type == "Notable" then
+				mustNot[id] = true
+			end
+		end
+		local optimizer2, result2 = run({ points = 12, fromScratch = true, mustHave = { [mustHave.id] = true }, mustNot = mustNot })
+		assert.is_truthy(result2.best.nodes[mustHave.id])
+		for id in pairs(mustNot) do
+			assert.is_nil(result2.best.nodes[id])
+		end
+		assertConnected(optimizer2, result2.best)
+	end)
+
+	it("reports an error when a must-have is unreachable", function()
+		local target = assert(findNotable(3))
+		-- Wall off the target by banning every neighbour
+		local mustNot = { }
+		for _, other in ipairs(target.linked) do
+			mustNot[other.id] = true
+		end
+		local optimizer = TreeOptimizer.new(build, { powerStat = lifeStat, points = 20, fromScratch = true, mustHave = { [target.id] = true }, mustNot = mustNot })
+		local result = optimizer:Run()
+		assert.is_truthy(result.error)
+	end)
+
+	it("treats manual attribute requirements as constraints", function()
+		local _, result = run({ points = 15, fromScratch = true, requirements = { Str = 60 } })
+		local str = result.bestEval.attributes.Str
+		assert.are.equal(60, str.req)
+		assert.is_true(str.have >= 60)
+		assert.are.equal(0, result.bestEval.deficit)
+	end)
+
+	it("keeps the minimum unreserved mana", function()
+		local minMana = math.floor(build.calcsTab.mainOutput.ManaUnreserved) + 30
+		local optimizer, result = run({ points = 20, fromScratch = true, requirements = { ManaUnreserved = minMana } })
+		assert.are.equal(0, result.bestEval.deficit)
+		optimizer:ApplyToNewSpec(result.best)
+		build.buildFlag = true
+		runCallback("OnFrame")
+		assert.is_true(build.calcsTab.mainOutput.ManaUnreserved >= minMana)
+	end)
+
+	describe("main skill cost sustain", function()
+		-- A level 1 Witch casting Fireball: costs ~7 mana/s against 1 mana/s of regeneration, and nothing near the
+		-- Witch start gives life, so maximising life alone neglects mana recovery
+		local function fireballWitch()
+			build.spec:SelectClass(3)
+			build.skillsTab:PasteSocketGroup("Fireball 1/0  1\n")
+			build.buildFlag = true
+			runCallback("OnFrame")
+			runCallback("OnFrame")
+		end
+		local function appliedSustain(optimizer, result)
+			optimizer:ApplyToNewSpec(result.best)
+			build.buildFlag = true
+			runCallback("OnFrame")
+			local out = build.calcsTab.mainOutput
+			return out.ManaPerSecondCost, out.ManaRegenRecovery + (out.ManaLeechGainRate or 0)
+		end
+
+		it("requires recovery to keep up with the main skill's cost per second", function()
+			fireballWitch()
+			local probe = TreeOptimizer.new(build, { powerStat = lifeStat })
+			local initial = probe:Evaluate(probe:NewState())
+			assert.is_true(initial.deficit > 0)
+			assert.is_truthy(initial.violations[1]:match("main skill costs"))
+
+			local optimizer, result = run({ points = 30, maxEvals = 300 })
+			assert.are.equal(0, result.bestEval.deficit)
+			local cost, recovery = appliedSustain(optimizer, result)
+			assert.is_true(cost > 0)
+			assert.is_true(recovery >= cost)
+		end)
+
+		it("can be turned off", function()
+			fireballWitch()
+			local optimizer, result = run({ points = 30, maxEvals = 600, requirements = { SustainCost = 0 } })
+			assert.is_false(optimizer.sustainCost)
+			assert.are.equal(0, result.bestEval.deficit)
+			-- Every point is spent even though nothing within the usual path length adds life
+			assert.are.equal(30, result.best.count)
+			local cost, recovery = appliedSustain(optimizer, result)
+			assert.is_true(recovery < cost)
+		end)
+
+		it("pools mana and energy shield recovery under Eldritch Battery", function()
+			local shortfalls = TreeOptimizer.SustainShortfalls({ ManaPerSecondCost = 0, ESPerSecondCost = 50, ManaRegenRecovery = 20, EnergyShieldRegenRecovery = 10, EnergyShieldRecharge = 0 })
+			assert.are.equal(1, #shortfalls)
+			assert.are.equal("ES", shortfalls[1].label)
+			assert.are.equal(10, shortfalls[1].recovery)
+
+			shortfalls = TreeOptimizer.SustainShortfalls({ ESPerSecondCost = 50, ManaRegenRecovery = 20, EnergyShieldRegenRecovery = 10, EnergyShieldLeechGainRate = 25, EnergyShieldProtectsMana = true })
+			assert.are.equal(0, #shortfalls)
+
+			-- Net regen (after degens) replaces gross regen, and percent costs scale with the pool
+			shortfalls = TreeOptimizer.SustainShortfalls({ ManaPercentPerSecondCost = 2, Mana = 1000, ManaRegenRecovery = 30, NetManaRegen = 15, ManaLeechGainRate = 4 })
+			assert.are.equal(1, #shortfalls)
+			assert.are.equal(20, shortfalls[1].cost)
+			assert.are.equal(19, shortfalls[1].recovery)
+		end)
+	end)
+
+	describe("jewel sockets", function()
+		-- Allocates the shortest path to the nearest jewel socket and puts `item` in it
+		local function socketJewel(item)
+			local spec = build.spec
+			local start = spec.nodes[spec.curClass.startNodeId]
+			local queue, parent, head = { start }, { [start.id] = false }, 1
+			local socket
+			while queue[head] do
+				local node = queue[head]
+				head = head + 1
+				if node.isJewelSocket then
+					socket = node
+					break
+				end
+				for _, other in ipairs(node.linked) do
+					if parent[other.id] == nil and other.type ~= "Mastery" and not other.ascendancyName then
+						parent[other.id] = node
+						table.insert(queue, other)
+					end
+				end
+			end
+			local node = socket
+			while node do
+				node.alloc = true
+				spec.allocNodes[node.id] = node
+				node = parent[node.id] or nil
+			end
+			build.itemsTab:AddItem(item, true)
+			spec.jewels[socket.id] = item.id
+			build.itemsTab.sockets[socket.id].selItemId = item.id
+			spec:BuildAllDependsAndPaths()
+			build.buildFlag = true
+			-- The newly socketed jewel only shows up in the main output on the second pass
+			runCallback("OnFrame")
+			runCallback("OnFrame")
+			return socket
+		end
+
+		local function currentState(optimizer)
+			local state = optimizer:NewState()
+			for _, node in pairs(build.spec.allocNodes) do
+				if not node.ascendancyName and node.type ~= "ClassStart" and node.type ~= "AscendClassStart" then
+					optimizer:AddNode(state, node)
+				end
+			end
+			return state
+		end
+
+		local function lifeJewel()
+			return new("Item"):Item("Rarity: RARE\nTest Spark\nCrimson Jewel\nImplicits: 0\n+200 to maximum Life\n")
+		end
+
+		it("treats sockets as regular nodes that carry their jewel", function()
+			local socket = socketJewel(lifeJewel())
+			local optimizer = TreeOptimizer.new(build, { powerStat = lifeStat })
+			assert.is_nil(next(optimizer.lockedSockets))
+			assert.is_nil(optimizer.mustHave[socket.id])
+
+			local state = currentState(optimizer)
+			local withJewel = optimizer:Evaluate(state).value
+			assert.are.near(build.calcsTab.mainOutput.Life, withJewel, 0.5)
+			local without = optimizer:CopyState(state)
+			optimizer:RemoveNode(without, socket.id)
+			assert.is_true(withJewel - optimizer:Evaluate(without).value >= 200)
+
+			-- Dropping the socket evaluates the same as a tree that really doesn't have it
+			local predicted = optimizer:Evaluate(without).value
+			optimizer:ApplyToNewSpec(without)
+			build.buildFlag = true
+			runCallback("OnFrame")
+			assert.are.near(predicted, build.calcsTab.mainOutput.Life, 0.5)
+		end)
+
+		it("leaves out unallocated sockets whose jewel is socketed elsewhere", function()
+			local socket = socketJewel(lifeJewel())
+			local otherSocket
+			for _, node in pairs(build.spec.nodes) do
+				if node.isJewelSocket and not node.alloc and not node.expansionJewel then
+					otherSocket = node
+					break
+				end
+			end
+			build.spec.jewels[otherSocket.id] = build.spec.jewels[socket.id]
+			local optimizer = TreeOptimizer.new(build, { powerStat = lifeStat })
+			assert.is_true(optimizer.mustNot[otherSocket.id])
+			assert.is_truthy(optimizer.lockedSockets[otherSocket.id])
+			assert.is_nil(optimizer.lockedSockets[socket.id])
+		end)
+
+		it("reverts nodes conquered by a timeless jewel when its socket is dropped", function()
+			local socket = socketJewel(new("Item"):Item("Rarity: UNIQUE\nLethal Pride\nTimeless Jewel\nRadius: Large\nImplicits: 0\nCommanded leadership over 10000 warriors under Kaom\n"))
+			-- The timeless LUTs don't load headless, so simulate a conquest on an allocated node in radius
+			local item = build.itemsTab.items[build.spec.jewels[socket.id]]
+			local conquered
+			for nodeId in pairs(socket.nodesInRadius[item.jewelRadiusIndex]) do
+				local node = build.spec.nodes[nodeId]
+				if node and node.alloc and node.type == "Normal" then
+					conquered = node
+					break
+				end
+			end
+			assert.is_truthy(conquered)
+			conquered.conqueredBy = { id = 10000, conqueror = { id = 1, type = "karui" } }
+			conquered.modList = new("ModList"):ModList()
+			conquered.modList:NewMod("Life", "BASE", 100, "Timeless Jewel")
+			build.calcsTab:BuildOutput()
+
+			local optimizer = TreeOptimizer.new(build, { powerStat = lifeStat })
+			assert.are.equal(socket.id, optimizer.conqueredBySocket[conquered.id])
+			assert.is_nil(optimizer.mustHave[socket.id])
+			local state = currentState(optimizer)
+			local without = optimizer:CopyState(state)
+			optimizer:RemoveNode(without, socket.id)
+			assert.is_true(optimizer:Evaluate(state).value - optimizer:Evaluate(without).value >= 100)
+			-- The spec's conquered node is restored after evaluating
+			assert.are.equal(conquered, build.spec.nodes[conquered.id])
+		end)
+
+		it("counts nodes in an Intuitive Leap-like radius as connected while the socket is in the tree", function()
+			local socket = socketJewel(new("Item"):Item("Rarity: UNIQUE\nThread of Hope\nCrimson Jewel\nVariant: Large Ring\nSelected Variant: 1\nRadius: Variable\nImplicits: 0\nOnly affects Passives in Large Ring\nPassives in Radius can be Allocated without being connected to your Tree\n"))
+			local optimizer = TreeOptimizer.new(build, { powerStat = lifeStat })
+			local target
+			for _, node in ipairs(optimizer.leapNodes) do
+				if not node.alloc and node.type == "Normal" and optimizer:IsEligible(node) then
+					target = node
+					break
+				end
+			end
+			assert.is_truthy(target)
+			local state = currentState(optimizer)
+			local dist = optimizer:Frontier(state, 4)
+			assert.are.equal(1, dist[target.id])
+
+			optimizer:AddNode(state, target)
+			assert.is_true(optimizer:Reachable(state.nodes)[target.id] == true)
+			-- Without the socket the node is cut off
+			assert.is_nil(optimizer:Reachable(state.nodes, socket.id)[target.id])
+		end)
+	end)
+
+	it("toggles optimizer marks, ignoring ascendancy and start nodes", function()
+		local notable = assert(findNotable(2))
+		local treeTab = build.treeTab
+		treeTab:ToggleOptimizerMark(notable, "must")
+		assert.are.equal("must", build.spec.optimizerMarks[notable.id])
+		treeTab:ToggleOptimizerMark(notable, "not")
+		assert.are.equal("not", build.spec.optimizerMarks[notable.id])
+		treeTab:ToggleOptimizerMark(notable, "not")
+		assert.is_nil(build.spec.optimizerMarks[notable.id])
+
+		for _, node in pairs(build.spec.nodes) do
+			if node.ascendancyName or node.type == "ClassStart" then
+				treeTab:ToggleOptimizerMark(node, "must")
+				assert.is_nil(build.spec.optimizerMarks[node.id])
+				break
+			end
+		end
+	end)
+
+	it("saves and loads optimizer marks and requirements", function()
+		local mustHave = assert(findNotable(3))
+		local mustNot = assert(findNotable(5))
+		build.spec.optimizerMarks[mustHave.id] = "must"
+		build.spec.optimizerMarks[mustNot.id] = "not"
+		build.spec.optimizerRequirements.Str = 120
+		build.spec.optimizerRequirements.Int = 80
+		build.spec.optimizerRequirements.ManaUnreserved = 150
+		build.spec.optimizerRequirements.SustainCost = 0
+
+		loadBuildFromXML(build:SaveDB("test"), "test")
+		assert.are.equal(0, build.spec.optimizerRequirements.SustainCost)
+		assert.are.equal("must", build.spec.optimizerMarks[mustHave.id])
+		assert.are.equal("not", build.spec.optimizerMarks[mustNot.id])
+		assert.are.equal(120, build.spec.optimizerRequirements.Str)
+		assert.are.equal(80, build.spec.optimizerRequirements.Int)
+		assert.is_nil(build.spec.optimizerRequirements.Dex)
+		assert.are.equal(150, build.spec.optimizerRequirements.ManaUnreserved)
+	end)
+
+	it("runs from the Tree tab popup and applies the result as a new tree", function()
+		local treeTab = build.treeTab
+		local mustHave = assert(findNotable(4))
+		build.spec.optimizerMarks[mustHave.id] = "must"
+		local oldSpec = build.spec
+		local specCount = #treeTab.specList
+
+		treeTab:OpenOptimizerPopup()
+		local popup = main.popups[1]
+		local controls = popup.controls
+		treeTab.optimizerSettings.powerStat = lifeStat
+		treeTab.optimizerSettings.points = 10
+		treeTab.optimizerSettings.fromScratch = true
+		treeTab.optimizerSettings.timeLimit = 2
+		assert.is_string(controls.status.label())
+		assert.is_falsy(controls.apply:IsEnabled())
+
+		controls.run.onClick()
+		local frames = 0
+		while treeTab.optimizerRun.co and frames < 10000 do
+			treeTab:ResumeOptimizer()
+			frames = frames + 1
+		end
+		local run = treeTab.optimizerRun
+		assert.is_nil(run.error)
+		assert.is_truthy(run.result)
+		assert.is_truthy(run.result.best.nodes[mustHave.id])
+		assert.is_string(controls.status.label())
+		assert.is_string(controls.details.label())
+		assert.is_true(controls.apply:IsEnabled())
+
+		controls.apply.onClick()
+		assert.are.equal(specCount + 1, #treeTab.specList)
+		assert.are_not.equal(oldSpec, build.spec)
+		assert.is_truthy(build.spec.allocNodes[mustHave.id])
+		assert.are.equal("must", build.spec.optimizerMarks[mustHave.id])
+		-- The optimizer popup closed (other popups may be left over from earlier tests)
+		assert.are_not.equal(popup, main.popups[1])
+	end)
+
+	it("applies the result as a new tree that matches the prediction", function()
+		local optimizer, result = run({ points = 10, fromScratch = true })
+		local specCount = #build.treeTab.specList
+		optimizer:ApplyToNewSpec(result.best)
+		assert.are.equal(specCount + 1, #build.treeTab.specList)
+		build.buildFlag = true
+		runCallback("OnFrame")
+		assert.are.equal(result.best.count, (build.spec:CountAllocNodes()))
+		assert.are.near(result.bestEval.value, build.calcsTab.mainOutput.Life, 0.5)
+	end)
+end)

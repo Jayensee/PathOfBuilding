@@ -3337,6 +3337,7 @@ skills["SupportNightblade"] = {
 	excludeSkillTypes = { SkillType.CreatesMinion, },
 	ignoreMinionTypes = true,
 	weaponTypes = {
+		["None"] = true,
 		["Claw"] = true,
 		["Dagger"] = true,
 	},
