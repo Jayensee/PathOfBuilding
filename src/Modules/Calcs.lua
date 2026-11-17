@@ -62,7 +62,7 @@ local function powerMetricCalc(env)
 	if type(output.Speed) == "number" then
 		speed = output.Speed
 	end
-	local tank_metric = ((1/(1/output.EffectiveMaximumHitTaken + 1/output.TotalEHP) ^ 2 * 5 / reciprocal_sum ) ^ (1/3))
+	local tank_metric = (((3/(1/output.EffectiveMaximumHitTaken + 2/output.TotalEHP)) ^ 2 * 5 / reciprocal_sum ) ^ (1/3))
 	-- Use Full DPS when skills are added to it, otherwise fall back to the selected main skill (same as the Full DPS sort)
 	local damage_metric = output.FullDPS
 	if not damage_metric or not (output.SkillDPS and #output.SkillDPS > 0) then
