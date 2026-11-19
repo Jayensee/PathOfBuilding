@@ -39,7 +39,10 @@ function ItemDBClass:ItemDBControl(anchor, rect, itemsTab, db, dbType)
 	self.leaguesAndTypesLoaded = false
 	self.leagueList = { "Any league", "No league" }
 	self.typeList = { "Any type", "Armour", "Jewellery", "One Handed Melee", "Two Handed Melee" }
-	self.slotList = { "Any slot", "Weapon 1", "Weapon 2", "Helmet", "Body Armour", "Gloves", "Boots", "Amulet", "Ring", "Belt", "Jewel", "Flask", "Graft 1", "Graft 2" }
+	self.slotList = { "Any slot", "Weapon 1", "Weapon 2", "Helmet", "Body Armour", "Gloves", "Boots", "Amulet", "Ring", "Belt", "Jewel", "Flask", "Graft 1", "Graft 2",
+		-- Wickerman (3.30)
+		"Head", "Body", "Arm", "Leg"
+	}
 	if dbType == "STASH" then
 		self.leagueList = { "Any tab" }
 	end
