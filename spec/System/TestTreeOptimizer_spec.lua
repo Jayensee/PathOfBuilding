@@ -96,6 +96,87 @@ describe("TreeOptimizer", function()
 		assert.is_true(build.calcsTab.mainOutput.ManaUnreserved >= minMana)
 	end)
 
+	describe("multi-point moves", function()
+		-- Greedy tree built from single node steps, so notables a few points away are never taken
+		local function shortSightedTree(points)
+			local optimizer = TreeOptimizer.new(build, { powerStat = lifeStat, points = points, fromScratch = true, maxPathLength = 1 })
+			local state = optimizer:NewState()
+			optimizer:Fill(state, points)
+			return optimizer, state
+		end
+		local function assertValidSwap(optimizer, before, after, points)
+			assert.is_true(after.count <= points)
+			assertConnected(optimizer, after)
+			assert.is_true(optimizer:IsBetter(optimizer:Evaluate(after), optimizer:Evaluate(before)))
+		end
+
+		it("swaps cheap branches for the path to a notable further than a fill step reaches", function()
+			local optimizer, state = shortSightedTree(15)
+			local after = optimizer:FarSwap(state, 15, optimizer:BranchLossFunction({ }))
+			assert.is_truthy(after)
+			assertValidSwap(optimizer, state, after, 15)
+			local gotFarNode = false
+			for id, node in pairs(after.nodes) do
+				if not state.nodes[id] and node.type ~= "Normal" and node.type ~= "Mastery" then
+					gotFarNode = true
+				end
+			end
+			assert.is_true(gotFarNode)
+		end)
+
+		it("predicts single node changes exactly with the node value model", function()
+			local optimizer, state = shortSightedTree(10)
+			optimizer.points = 10
+			local model = optimizer:BuildModel(state)
+			assert.is_truthy(model)
+			local function close(a, b)
+				return math.abs(a - b) < 1e-6 * math.max(1, math.abs(b))
+			end
+			assert.is_true(close(optimizer:ModelEvaluate(model, state).score, optimizer:Evaluate(state).score))
+			-- Removing a leaf and adding a frontier node, each on their own, match a full calculation
+			local branch = optimizer:RemovableBranches(state, 1)[1]
+			local removed = optimizer:CopyState(state)
+			optimizer:RemoveNode(removed, branch.ids[1])
+			local addId
+			for id in pairs(optimizer:Frontier(state, 1)) do
+				if build.spec.nodes[id].type ~= "Mastery" and (not addId or id < addId) then
+					addId = id
+				end
+			end
+			local added = optimizer:CopyState(state)
+			optimizer:AddNode(added, build.spec.nodes[addId])
+			for _, trial in ipairs({ removed, added }) do
+				local predicted = optimizer:ModelEvaluate(model, trial)
+				trial.eval = nil
+				assert.is_true(close(predicted.score, optimizer:Evaluate(trial).score))
+			end
+		end)
+
+		it("only returns model round results that a full calculation confirms", function()
+			local optimizer, state = shortSightedTree(15)
+			optimizer.points = 15
+			optimizer.startTime = os.clock()
+			optimizer:Track(state)
+			local before = optimizer:Evaluate(state)
+			local after = optimizer:ModelRound(math.huge)
+			if after then
+				assert.is_true(after.count <= 15)
+				assertConnected(optimizer, after)
+				after.eval = nil
+				assert.is_true(optimizer:IsBetter(optimizer:Evaluate(after), before))
+			end
+		end)
+
+		it("only reroutes to trees that stay connected and score better", function()
+			local optimizer, state = shortSightedTree(15)
+			local after = optimizer:Reroute(state)
+			if after then
+				assert.are.equal(state.count, after.count)
+				assertValidSwap(optimizer, state, after, 15)
+			end
+		end)
+	end)
+
 	describe("main skill cost sustain", function()
 		-- A level 1 Witch casting Fireball: costs ~7 mana/s against 1 mana/s of regeneration, and nothing near the
 		-- Witch start gives life, so maximising life alone neglects mana recovery
