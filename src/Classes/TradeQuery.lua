@@ -258,22 +258,16 @@ end
 
 local function initStatSortSelectionList(list)
 	t_insert(list,  {
-		label = "Full DPS",
-		stat = "FullDPS",
+		label = "Power Metric",
+		stat = "PowerMetric",
 		weightMult = 1.0,
-	})
-	t_insert(list,  {
-		label = "Effective Hit Pool",
-		stat = "TotalEHP",
-		weightMult = 0.5,
 	})
 end
 
 -- we do not want to overwrite previous list if the new list is the default, e.g. hitting reset multiple times in a row
 local function isSameAsDefaultList(list)
-	return list and #list == 2
-		and list[1].stat == "FullDPS" and list[1].weightMult == 1.0
-		and list[2].stat == "TotalEHP" and list[2].weightMult == 0.5
+	return list and #list == 1
+		and list[1].stat == "PowerMetric" and list[1].weightMult == 1.0
 end
 
 -- Opens the item pricing popup
