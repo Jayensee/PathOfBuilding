@@ -39,6 +39,10 @@ end
 
 local function powerMetricCalc(env)
 	local output = env.player.output
+	-- Hit-based EHP isn't calculated in some configs (e.g. enemy damage type "Damage over Time")
+	if not output.TotalEHP or not output.EffectiveMaximumHitTaken then
+		return nil
+	end
 	local reciprocal_sum = 0.0
 	-- Net sustain can be zero or negative (e.g. degen bigger than regen + leech), which would make the cube root
 	-- below NaN/0. Below this threshold the value is mapped smoothly onto (0, threshold) as k^2 / (2k - x):
