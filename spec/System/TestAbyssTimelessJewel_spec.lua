@@ -293,7 +293,11 @@ describe("Abyss timeless jewels", function()
 		build.timelessData.jewelSocket = { id = 26196 }
 		build.treeTab:FindTimelessJewel()
 		local controls = main.popups[1].controls
-		controls.fallbackWeightsList.selIndex = 1 -- Full DPS
+		for index, entry in ipairs(controls.fallbackWeightsList.list) do
+			if entry.stat == "FullDPS" then
+				controls.fallbackWeightsList.selIndex = index
+			end
+		end
 		controls.fallbackWeightsButton.onClick()
 
 		assert.matches("abyss_special_notable_17, 1, 0, 0", build.timelessData.searchListFallback, nil, true)
