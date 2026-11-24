@@ -31,6 +31,30 @@ local function getMatchingSocketQuality(env, groupCfg, gemInstance, socketIndex)
 	return gemColour and socket and socket.color == gemColour and data.misc.MatchingSocketQualityBonus or 0
 end
 
+-- Add everything in srcDB (mods in their original order, conditions, multipliers) to dstDB and return dstDB.
+-- The mod tables themselves are shared, the lists holding them are not.
+function calcs.copyDBInto(dstDB, srcDB)
+	local mods = dstDB.mods
+	for name, list in pairs(srcDB.mods) do
+		local dst = mods[name]
+		if not dst then
+			dst = { }
+			mods[name] = dst
+		end
+		local n = #dst
+		for i = 1, #list do
+			dst[n + i] = list[i]
+		end
+	end
+	for k, v in pairs(srcDB.conditions) do
+		dstDB.conditions[k] = v
+	end
+	for k, v in pairs(srcDB.multipliers) do
+		dstDB.multipliers[k] = v
+	end
+	return dstDB
+end
+
 -- Initialise modifier database with stats and conditions common to all actors
 function calcs.initModDB(env, modDB)
 	modDB:NewMod("FireResistMax", "BASE", data.characterConstants["base_maximum_all_resistances_%"], "Base")
@@ -656,7 +680,19 @@ function calcs.initEnv(build, mode, override, specEnv)
 	end
 	classStats = env.spec.tree.characterData and env.spec.tree.characterData[env.classId] or env.spec.tree.classes[env.classId]
 
-	if not cachedPlayerDB then
+	-- The misc calculator keeps a snapshot of the base (non-node) player/enemy mods. Every environment it builds without a
+	-- cache gets an identical flat copy of it instead of recomputing it, so the mods are not split over a parent database
+	local baseSnapshot = calcs.miscBaseSnapshot
+	if baseSnapshot and (baseSnapshot.build ~= build or mode ~= "CALCULATOR" or override.spec or cachedPlayerDB or (specEnv and specEnv.env)) then
+		baseSnapshot = nil
+	end
+
+	if baseSnapshot then
+		calcs.copyDBInto(modDB, baseSnapshot.player)
+		calcs.copyDBInto(enemyDB, baseSnapshot.enemy)
+		cachedPlayerDB = calcs.copyDBInto(new("ModDB"):ModDB(), baseSnapshot.player)
+		cachedEnemyDB = calcs.copyDBInto(new("ModDB"):ModDB(), baseSnapshot.enemy)
+	elseif not cachedPlayerDB then
 		-- Initialise modifier database with base values
 		for _, stat in pairs({"Str","Dex","Int"}) do
 			modDB:NewMod(stat, "BASE", classStats["base_"..stat:lower()], "Base")
