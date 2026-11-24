@@ -18,6 +18,8 @@
 --   BENCH_PROFILE  "0" disables method timing (default: on; it costs a few percent of run time)
 --   BENCH_OUT      writable directory for bench_<tag>.json / bench_<tag>.csv
 --   BENCH_TAG      suffix for the output files (default: "run")
+--   BENCH_ALLOW_MISSING_LUT  "1" runs builds even when timeless jewel data (src/Data/TimelessJewelData/*.bin) is missing;
+--                  their scores are NOT comparable with runs that have it (default: such builds fail with an error)
 --   BENCH_OPTIONS  extra optimizer options as Lua table fields, e.g. "useModel=false, maxPathLength=5"
 --
 -- Times are os.clock() CPU seconds, the same clock the optimizer uses when running headless.
@@ -165,7 +167,17 @@ end
 -- Headless Inflate is a stub, so timeless jewel data (e.g. Glorious Vanity) can't be decompressed and builds using it
 -- fail to calculate. Point the loader at the uncompressed .bin cache the desktop app writes next to the .zip parts
 -- (src/Data/TimelessJewelData/*.bin, gitignored) when one exists.
+local missingLUT = 0
 local function useUncompressedJewelData()
+	-- Without the data a timeless jewel silently does nothing, which changes the build's stats (and the hand-made
+	-- tree's score by 10-15%), so count the warnings and refuse to report numbers that aren't comparable.
+	local conPrintf = _G.ConPrintf
+	_G.ConPrintf = function(fmt, ...)
+		if type(fmt) == "string" and fmt:find("Missing LUT", 1, true) then
+			missingLUT = missingLUT + 1
+		end
+		return conPrintf(fmt, ...)
+	end
 	-- busted runs spec files in their own environment, so set the global on _G
 	local newFileSearch = _G.NewFileSearch
 	_G.NewFileSearch = function(spec, ...)
@@ -271,7 +283,12 @@ local function round(x, digits)
 end
 
 local function runOne(dir, file, mode, settings)
+	missingLUT = 0
 	loadBuild(dir, file)
+	if missingLUT > 0 and env("BENCH_ALLOW_MISSING_LUT", "0") ~= "1" then
+		error("timeless jewel data is missing (" .. missingLUT .. " 'Missing LUT' warnings): the jewel would do nothing and scores would differ from runs with " ..
+			"src/Data/TimelessJewelData/*.bin. Copy the .bin files (gitignored, written by the desktop app) into this checkout, or set BENCH_ALLOW_MISSING_LUT=1", 0)
+	end
 	collectgarbage("collect")
 	local TreeOptimizer = LoadModule("Modules/TreeOptimizer")
 	local optimizer = TreeOptimizer.new(build, uiOptions(mode, settings.timeLimit, settings.seed, settings.extra))
