@@ -13,6 +13,8 @@
 --   3. Trim: while over budget, remove the branch that costs the least score per point.
 --   4. Fill: lazy greedy - repeatedly add the path with the best score gain per point. Never-evaluated paths take the
 --      estimate of a node with the same kind of stats, and a mastery's effects are ranked once per kind of mastery.
+--      Then, if the tree misses its requirements, Repair swaps branches for the paths that remove the most deficit per
+--      point, from anywhere within 12 points. A tree that meets the requirements always beats one that doesn't.
 --   5. Refine: remove a branch, refill without it, keep the result if it scored better. When no branch helps, swap a
 --      travel node for a neighbour (Reroute), or take the path to a notable/keystone 5-12 points away and pay for it
 --      with the cheapest branches anywhere in the tree (FarSwap).
@@ -44,6 +46,9 @@ end
 
 -- Log-score cost of each missing attribute point. 10 missing points cost ~18% of the stat.
 local ATTRIBUTE_PENALTY = 0.02
+-- Log-score cost of each deficit point when comparing trees that don't meet the requirements (see Merit). Large enough
+-- that nearly any step towards meeting them is worth more than the stat it costs.
+local INFEASIBLE_PENALTY = 1
 local EPSILON = 1e-9
 
 ---@class TreeOptimizerOptions
@@ -321,6 +326,26 @@ local function buildPath(node, dist, parent)
 	return path
 end
 
+-- Path to `node` (target first, as buildPath returns it). A node conquered by a timeless jewel only has its conquered stats
+-- while the jewel's socket is in the tree (see CalcNode), so the path to the socket comes with it.
+function TreeOptimizer:TargetPath(state, node, dist, parent)
+	local path = buildPath(node, dist, parent)
+	local socketId = self.conqueredBySocket[node.id]
+	if socketId and not state.nodes[socketId] and dist[socketId] then
+		local onPath = { }
+		for _, other in ipairs(path) do
+			onPath[other.id] = true
+		end
+		for _, other in ipairs(buildPath(self.spec.nodes[socketId], dist, parent)) do
+			if not onPath[other.id] then
+				t_insert(path, other)
+				onPath[other.id] = true
+			end
+		end
+	end
+	return path
+end
+
 -- Masteries
 
 function TreeOptimizer:GetMasteryEffects(node)
@@ -540,6 +565,13 @@ end
 function TreeOptimizer:ConstraintDeficit(output)
 	local deficit = 0
 	local attributes = { }
+	-- Substrings of mod names that can help with the violated constraints (see Repair)
+	local needs = { }
+	local function need(...)
+		for _, pattern in ipairs({ ... }) do
+			needs[pattern] = true
+		end
+	end
 	local omni = output.ReqOmni and output.ReqOmni > 0
 	for _, attr in ipairs(omni and { "Omni" } or { "Str", "Dex", "Int" }) do
 		local req = self.requirements[attr] or output["Req" .. attr] or 0
@@ -547,32 +579,45 @@ function TreeOptimizer:ConstraintDeficit(output)
 		attributes[attr] = { req = req, have = have }
 		if have < req then
 			deficit = deficit + (req - have)
+			need(attr, "Attribute")
 		end
 	end
 	local violations = { }
 	if output.LifeUnreserved and output.LifeUnreserved < 1 and not output.ChaosInoculation then
 		deficit = deficit + (1 - output.LifeUnreserved) * 0.5
 		t_insert(violations, "unreserved life below 1")
+		need("Life", "Reserv")
 	end
 	local minMana = self.requirements.ManaUnreserved or 0
 	if output.ManaUnreserved and output.ManaUnreserved < minMana then
 		deficit = deficit + (minMana - output.ManaUnreserved) * 0.5
 		t_insert(violations, minMana > 0 and ("unreserved mana below " .. minMana) or "unreserved mana negative")
+		need("Mana", "Reserv")
 	end
 	for _, skillCost in ipairs(self.skillCosts) do
 		local shortfall = self:SkillCostShortfall(skillCost, output)
 		if shortfall > 0 then
 			deficit = deficit + COST_WARNING_DEFICIT + shortfall * 0.5
 			t_insert(violations, "can't pay " .. skillCost.pool:gsub("Unreserved", "") .. " cost of " .. skillCost.name)
+			need((skillCost.pool:gsub("Unreserved", ""):gsub("Percent", "")), "Reserv", "Cost")
+			if skillCost.addES then
+				need("EnergyShield")
+			end
 		end
 	end
 	if self.sustainCost then
 		for _, shortfall in ipairs(TreeOptimizer.SustainShortfalls(output)) do
 			deficit = deficit + (1 - shortfall.recovery / shortfall.cost) * 100 * SUSTAIN_DEFICIT_PER_PERCENT
 			t_insert(violations, string.format("main skill costs %.1f %s/s, recovering %.1f/s", shortfall.cost, shortfall.label, shortfall.recovery))
+			need("Cost")
+			for resource, label in pairs({ Mana = "mana", EnergyShield = "ES", Life = "life" }) do
+				if shortfall.label:find(label, 1, true) then
+					need(resource)
+				end
+			end
 		end
 	end
-	return deficit, attributes, violations
+	return deficit, attributes, violations, needs
 end
 
 -- Everything ConstraintDeficit reads, so the node value model can predict constraints from summed node effects
@@ -586,7 +631,7 @@ local CONSTRAINT_FLAGS = { "ChaosInoculation", "EnergyShieldProtectsMana" }
 
 function TreeOptimizer:ScoreFromOutput(output)
 	local value = data.powerStatList.GetFromOutput(output, self.powerStat)
-	local deficit, attributes, violations = self:ConstraintDeficit(output)
+	local deficit, attributes, violations, needs = self:ConstraintDeficit(output)
 	-- Work in log space so gains are relative (a 2% increase is worth the same anywhere)
 	local logValue = value > 0 and m_log(value) or (-100 + value * EPSILON)
 	local fields
@@ -604,6 +649,7 @@ function TreeOptimizer:ScoreFromOutput(output)
 		deficit = deficit,
 		attributes = attributes,
 		violations = violations,
+		needs = needs,
 		score = logValue - deficit * ATTRIBUTE_PENALTY,
 		fields = fields,
 	}
@@ -676,12 +722,24 @@ function TreeOptimizer:Evaluate(state)
 	return result
 end
 
--- Feasible trees always beat infeasible ones; otherwise compare the penalised score
+-- Score that weighs the constraint deficit heavily, for choosing between trees that don't meet the requirements: a tree
+-- that is closer to meeting them is better unless the other one is much stronger. Repair ranks its moves by it.
+function TreeOptimizer:Merit(eval)
+	if eval.deficit == 0 then
+		return eval.score
+	end
+	return eval.score - eval.deficit * INFEASIBLE_PENALTY
+end
+
+-- Feasible trees always beat infeasible ones. Feasible trees compare by score, infeasible ones by merit.
 function TreeOptimizer:IsBetter(a, b)
 	if (a.deficit == 0) ~= (b.deficit == 0) then
 		return a.deficit == 0
 	end
-	return a.score > b.score + EPSILON
+	if a.deficit == 0 then
+		return a.score > b.score + EPSILON
+	end
+	return self:Merit(a) > self:Merit(b) + EPSILON
 end
 
 function TreeOptimizer:Track(state)
@@ -949,8 +1007,13 @@ function TreeOptimizer:Fill(state, budget, banned)
 		for id, d in pairs(dist) do
 			local node = self.spec.nodes[id]
 			if node.type ~= "Mastery" or d <= masteryReach then
+				local path
+				if self.conqueredBySocket[id] then
+					path = self:TargetPath(state, node, dist, parent)
+					d = #path
+				end
 				local est = estimates[id]
-				t_insert(candidates, { id = id, node = node, dist = d, priority = est and (est.gain / d), signature = self:NodeSignature(node), fresh = est and est.key == baseKey })
+				t_insert(candidates, { id = id, node = node, dist = d, path = path, priority = est and (est.gain / d), signature = self:NodeSignature(node), fresh = est and est.key == baseKey })
 			end
 		end
 		local accepted
@@ -967,7 +1030,7 @@ function TreeOptimizer:Fill(state, budget, banned)
 				break
 			end
 			-- Re-evaluate the most promising candidate against the current tree
-			local path = buildPath(best.node, dist, parent)
+			local path = best.path or buildPath(best.node, dist, parent)
 			local trial = self:CopyState(state)
 			for i = #path, 2, -1 do
 				self:AddNode(trial, path[i])
@@ -1262,6 +1325,211 @@ function TreeOptimizer:FarSwap(state, budget, lossOf)
 		end
 	end
 	return bestState
+end
+
+-- Constraint repair
+--
+-- The fill and refine phases chase the stat, and the small deficit penalty in the score only steers them towards nodes
+-- nearby. When the tree misses its requirements, Repair buys the path that adds the most merit per point (see Merit:
+-- nearly always the one that removes the most deficit per point) from anywhere within REPAIR_REACH, e.g. reservation
+-- efficiency on a cluster jewel across the tree, and pays for it with the branches that cost the least merit per point.
+-- It repeats until the requirements are met or no path helps. Only nodes with a mod that can affect a violated
+-- requirement are tried (see the `needs` of ConstraintDeficit), so a repair costs a few hundred calculations at most.
+-- Greedy steps can take the long way round (several Strength nodes instead of the keystone that ignores attribute
+-- requirements), so the best few paths that meet every requirement on their own are also tried, each as a single swap.
+
+-- Furthest a repair reaches
+local REPAIR_REACH = 12
+-- Masteries further away than this are left out (each effect costs a calculation)
+local REPAIR_MASTERY_REACH = 1
+-- Paths in a row that fail to improve the tree before the greedy repair gives up
+local REPAIR_TRIES = 3
+-- Paths that meet every requirement on their own that are tried as single swaps
+local REPAIR_FIXES = 2
+
+local function modsMatch(node, needs)
+	for _, mod in ipairs(node.modList or { }) do
+		for pattern in pairs(needs) do
+			if mod.name:find(pattern, 1, true) then
+				return true
+			end
+		end
+	end
+	return false
+end
+
+-- Whether `node`, `d` points from the tree, is worth trying in a repair. Returns the mastery effects to try for masteries.
+function TreeOptimizer:RepairCandidate(state, node, d, needs)
+	if node.type == "Mastery" then
+		if d > REPAIR_MASTERY_REACH then
+			return false
+		end
+		local effects = { }
+		for _, effectId in ipairs(self:AvailableEffects(state, node)) do
+			if modsMatch(self:GetEffectNode(node, effectId), needs) then
+				t_insert(effects, effectId)
+			end
+		end
+		return effects[1] ~= nil, effects
+	end
+	if node.type == "Keystone" or (node.isJewelSocket and self.spec.jewels[node.id]) then
+		return true
+	end
+	return modsMatch(node, needs)
+end
+
+-- Adds `path` (target first, as buildPath returns it) to a copy of `state`, then removes the branches elsewhere that cost
+-- the least merit per point until the tree is back within budget. Returns nil if it can't get back within budget.
+function TreeOptimizer:BuyAndSell(state, path, effectId, budget, lossOf)
+	local trial = self:CopyState(state)
+	local onPath = { }
+	for i = #path, 1, -1 do
+		self:AddNode(trial, path[i], i == 1 and effectId or nil)
+		onPath[path[i].id] = true
+	end
+	while trial.count > budget and not self.stopped do
+		local cheapest, cheapestLoss
+		for _, branch in ipairs(self:RemovableBranches(trial, self.maxBranchSize)) do
+			local touchesPath = false
+			for _, id in ipairs(branch.ids) do
+				if onPath[id] then
+					touchesPath = true
+					break
+				end
+			end
+			if not touchesPath then
+				local loss = lossOf(trial, branch)
+				if not cheapestLoss or loss < cheapestLoss then
+					cheapest, cheapestLoss = branch, loss
+				end
+			end
+		end
+		if not cheapest then
+			return nil
+		end
+		for _, id in ipairs(cheapest.ids) do
+			self:RemoveNode(trial, id)
+		end
+	end
+	return trial.count <= budget and trial or nil
+end
+
+function TreeOptimizer:Repair(state, budget)
+	local base = self:Evaluate(state)
+	if base.deficit == 0 then
+		return state
+	end
+	local original, originalEval = state, base
+	-- Merit lost per point by removing a branch, cached by its nodes (see BranchLossFunction)
+	local losses = { }
+	local function lossOf(from, branch)
+		local key = branchKey(from, branch)
+		if not losses[key] then
+			local without = self:CopyState(from)
+			for _, id in ipairs(branch.ids) do
+				self:RemoveNode(without, id)
+			end
+			losses[key] = (self:Merit(self:Evaluate(from)) - self:Merit(self:Evaluate(without))) / branch.size
+		end
+		return losses[key]
+	end
+	-- Spends points a swap freed beyond what it needed. The fill never makes a tree that meets its requirements miss them.
+	local function topUp(trial)
+		if trial.count < budget then
+			self:Fill(trial, budget)
+		end
+		return trial
+	end
+	-- [targetId] = { gain = merit gain per point, key = state key it was measured on, effectId }, and estimates for
+	-- targets never evaluated, by signature (see NodeSignature)
+	local estimates, signatureRates = { }, { }
+	-- Paths from the original tree that meet every requirement on their own
+	local fixes = { }
+	local failures = 0
+	while base.deficit > 0 and failures < REPAIR_TRIES and not self.stopped do
+		local baseKey = stateKey(state)
+		local dist, parent = self:Frontier(state, REPAIR_REACH)
+		local candidates = { }
+		for id, d in pairs(dist) do
+			local node = self.spec.nodes[id]
+			local ok, effects = self:RepairCandidate(state, node, d, base.needs)
+			if ok then
+				t_insert(candidates, { id = id, node = node, dist = d, effects = effects, signature = self:NodeSignature(node) })
+			end
+		end
+		t_sort(candidates, function(a, b) return a.id < b.id end)
+		-- Lazy greedy on merit gain per point, as in Fill: re-evaluate the best estimate until it is up to date
+		local accepted
+		while not self.stopped do
+			local best, bestPriority
+			for _, cand in ipairs(candidates) do
+				local est = estimates[cand.id]
+				local priority = est and est.gain or signatureRates[cand.signature] or math.huge
+				if not cand.done and (not best or priority > bestPriority) then
+					best, bestPriority = cand, priority
+				end
+			end
+			if not best or bestPriority <= EPSILON then
+				break
+			end
+			local est = estimates[best.id]
+			if est and est.key == baseKey then
+				accepted = best
+				break
+			end
+			local path = self:TargetPath(state, best.node, dist, parent)
+			local trial = self:CopyState(state)
+			for i = #path, 2, -1 do
+				self:AddNode(trial, path[i])
+			end
+			local bestEval, bestEffect
+			for _, effectId in ipairs(best.effects or { false }) do
+				local withTarget = self:CopyState(trial)
+				self:AddNode(withTarget, best.node, effectId or nil)
+				local eval = self:Evaluate(withTarget)
+				if not bestEval or self:Merit(eval) > self:Merit(bestEval) then
+					bestEval, bestEffect = eval, effectId
+				end
+			end
+			-- Only paths that reduce the deficit repair anything
+			local gain = bestEval.deficit < base.deficit - EPSILON and (self:Merit(bestEval) - self:Merit(base)) / #path or -math.huge
+			estimates[best.id] = { gain = gain, key = baseKey, effectId = bestEffect or nil }
+			signatureRates[best.signature] = gain
+			best.path = path
+			if bestEval.deficit == 0 and state == original then
+				t_insert(fixes, { path = path, effectId = bestEffect or nil, gain = gain })
+			end
+		end
+		if not accepted then
+			break
+		end
+		accepted.done = true
+		local trial = self:BuyAndSell(state, accepted.path or self:TargetPath(state, accepted.node, dist, parent), estimates[accepted.id].effectId, budget, lossOf)
+		local eval = trial and self:Evaluate(trial)
+		if trial and self:IsBetter(eval, base) then
+			state, base = trial, eval
+			failures = 0
+		else
+			failures = failures + 1
+		end
+	end
+	state = topUp(state)
+
+	-- Single swaps for the paths that meet every requirement on their own
+	t_sort(fixes, function(a, b) return a.gain > b.gain end)
+	for i = 1, m_min(REPAIR_FIXES, #fixes) do
+		if self.stopped then
+			break
+		end
+		local trial = self:BuyAndSell(original, fixes[i].path, fixes[i].effectId, budget, lossOf)
+		if trial then
+			trial = topUp(trial)
+			if self:IsBetter(self:Evaluate(trial), self:Evaluate(state)) then
+				state = trial
+			end
+		end
+	end
+	return self:IsBetter(self:Evaluate(state), originalEval) and state or original
 end
 
 -- Node value model
@@ -1627,6 +1895,14 @@ function TreeOptimizer:Run()
 	self.phase = "fill"
 	self:Fill(state, self.points)
 	self:Track(state)
+	-- Phase 4b: repair a tree that misses its requirements
+	local repaired
+	if self:Evaluate(state).deficit > 0 then
+		self.phase = "repair"
+		state = self:Repair(state, self.points)
+		self:Track(state)
+		repaired = self.best
+	end
 	local afterFill = self:CopyState(state)
 	local fillTime = now() - startTime
 	local fillEvals = self.evalCount
@@ -1643,7 +1919,13 @@ function TreeOptimizer:Run()
 	local bestLosses, bestLossesFor = { }, nil
 	while not self.stopped and now() < deadline do
 		local trial
-		if self.useModel and modelFailures < MODEL_MAX_FAILURES and (modelSucceeded or not modelScore or self.best.eval.score > modelScore + 0.01) then
+		-- A best tree that misses its requirements gets one repair before anything else is tried on it
+		if self.best.eval.deficit > 0 and repaired ~= self.best then
+			self.phase = "repair"
+			trial = self:Repair(self:CopyState(self.best), self.points)
+			repaired = self.best
+		end
+		if not trial and self.useModel and modelFailures < MODEL_MAX_FAILURES and (modelSucceeded or not modelScore or self.best.eval.score > modelScore + 0.01) then
 			modelRounds = modelRounds + 1
 			modelScore = self.best.eval.score
 			trial = self:ModelRound(deadline)

@@ -86,6 +86,37 @@ describe("TreeOptimizer", function()
 		assert.are.equal(0, result.bestEval.deficit)
 	end)
 
+	it("repairs a tree that misses its requirements by swapping nodes within the budget", function()
+		-- Fill for life only, then demand more Strength than that tree has
+		local probe = TreeOptimizer.new(build, { powerStat = lifeStat, points = 15, fromScratch = true })
+		local state = probe:NewState()
+		probe:Fill(state, 15)
+		local str = probe:Evaluate(state).attributes.Str.have
+		local optimizer = TreeOptimizer.new(build, { powerStat = lifeStat, points = 15, fromScratch = true, requirements = { Str = str + 25 } })
+		state.eval = nil
+		local before = optimizer:Evaluate(state)
+		assert.is_true(before.deficit > 0)
+		assert.is_truthy(before.needs.Str)
+		local after = optimizer:Repair(state, 15)
+		local eval = optimizer:Evaluate(after)
+		assert.are.equal(0, eval.deficit)
+		assert.is_true(eval.attributes.Str.have >= str + 25)
+		assert.is_true(after.count <= 15)
+		assertConnected(optimizer, after)
+		-- A tree that meets its requirements is left alone
+		assert.are.equal(after, optimizer:Repair(after, 15))
+	end)
+
+	it("prefers trees closer to meeting their requirements", function()
+		local optimizer = TreeOptimizer.new(build, { powerStat = lifeStat })
+		local valid = { deficit = 0, score = 1 }
+		local nearly = { deficit = 1, score = 2 }
+		local far = { deficit = 30, score = 3 }
+		assert.is_true(optimizer:IsBetter(valid, nearly))
+		assert.is_true(optimizer:IsBetter(nearly, far))
+		assert.is_false(optimizer:IsBetter(far, nearly))
+	end)
+
 	it("re-ranks a mastery's effects only after the tree has changed enough", function()
 		local optimizer = TreeOptimizer.new(build, { powerStat = lifeStat, fromScratch = true })
 		local mastery
