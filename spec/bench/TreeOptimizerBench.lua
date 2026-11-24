@@ -339,7 +339,21 @@ local function runOne(dir, file, mode, settings)
 	end
 	table.sort(phases, function(a, b) return a.time > b.time end)
 	local violations = finalEval.violations or { }
+	-- Notables, keystones and masteries the final tree gained and lost against the hand-made tree
+	local added, removed = optimizer:Diff(result.best)
+	local function names(list)
+		local out = { }
+		for _, entry in ipairs(list) do
+			if entry.node.type ~= "Normal" then
+				table.insert(out, (entry.node.name or "?") .. (entry.effectId and "*" or ""))
+			end
+		end
+		table.sort(out)
+		return out
+	end
 	return {
+		gained = names(added),
+		lost = names(removed),
 		build = file,
 		mode = mode,
 		points = optimizer.points,
