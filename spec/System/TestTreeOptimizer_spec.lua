@@ -152,6 +152,77 @@ describe("TreeOptimizer", function()
 			end
 		end)
 
+		it("finds the same removable branches in one pass as with a search per node", function()
+			local optimizer, state = shortSightedTree(25)
+			local _, filled = run({ points = 30, fromScratch = true })
+			for _, tree in ipairs({ state, filled.best }) do
+				for _, maxSize in ipairs({ 1, 3, 6, math.huge }) do
+					local function describe(branches)
+						local list = { }
+						for _, branch in ipairs(branches) do
+							local ids = copyTable(branch.ids)
+							table.sort(ids)
+							table.insert(list, branch.key .. "=" .. table.concat(ids, ","))
+						end
+						return table.concat(list, ";")
+					end
+					assert.is_truthy(optimizer:BranchCuts(tree))
+					local fast = describe(optimizer:RemovableBranches(tree, maxSize))
+					-- An Intuitive Leap-like makes RemovableBranches fall back to one search per node
+					local leapNodes = optimizer.leapNodes
+					optimizer.leapNodes = { { id = -1, intuitiveLeapLikesAffecting = { } } }
+					local slow = describe(optimizer:RemovableBranches(tree, maxSize))
+					optimizer.leapNodes = leapNodes
+					assert.are.equal(slow, fast)
+				end
+			end
+		end)
+
+		it("measures nodes with the same stats once, with exact predictions for each", function()
+			local optimizer, state = shortSightedTree(10)
+			optimizer.points = 10
+			local evalsBefore = optimizer.evalCount
+			local model = optimizer:BuildModel(state)
+			-- Two unallocated nodes with the same stats: one was measured, the other reuses its measurement
+			local bySignature, pair = { }, nil
+			for id in pairs(optimizer:Frontier(state, 6)) do
+				local node = build.spec.nodes[id]
+				if node.type ~= "Mastery" then
+					local signature = optimizer:ModelSignature(model, { id = id })
+					if signature and bySignature[signature] then
+						pair = { bySignature[signature], id }
+						break
+					elseif signature then
+						bySignature[signature] = id
+					end
+				end
+			end
+			assert.is_truthy(pair)
+			assert.are.equal(model.with[pair[1]].delta, model.with[pair[2]].delta)
+			local tasks = 0
+			for _ in pairs(model.with) do
+				tasks = tasks + 1
+			end
+			assert.is_true(optimizer.evalCount - evalsBefore < tasks)
+			for _, id in ipairs(pair) do
+				local trial = optimizer:CopyState(state)
+				optimizer:AddNode(trial, build.spec.nodes[id])
+				local predicted = optimizer:ModelEvaluate(model, trial)
+				trial.eval = nil
+				assert.is_true(math.abs(predicted.score - optimizer:Evaluate(trial).score) < 1e-6)
+			end
+		end)
+
+		it("doesn't measure the model past the deadline", function()
+			local optimizer, state = shortSightedTree(10)
+			optimizer.points = 10
+			optimizer.startTime = os.clock()
+			optimizer:Track(state)
+			local evalsBefore = optimizer.evalCount
+			assert.is_nil(optimizer:ModelRound(os.clock() - 1))
+			assert.are.equal(evalsBefore, optimizer.evalCount)
+		end)
+
 		it("only returns model round results that a full calculation confirms", function()
 			local optimizer, state = shortSightedTree(15)
 			optimizer.points = 15

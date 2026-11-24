@@ -15,10 +15,14 @@
 --   5. Refine: remove a branch, refill without it, keep the result if it scored better. When no branch helps, swap a
 --      travel node for a neighbour (Reroute), or take the path to a notable/keystone 5-12 points away and pay for it
 --      with the cheapest branches anywhere in the tree (FarSwap).
---   6. Until time runs out, alternating:
---      - Model rounds: measure every node near the best tree once, search a cheap additive model of the score with
---        the moves above, and check its best trees with full calculations (see BuildModel).
---      - Far swaps on the best tree, then random perturbation, each followed by Refine.
+--   6. Until time runs out (the deadline is checked after every calculation, in the model's measuring too):
+--      - Model rounds first: each measures one more chunk of nodes around the best tree (nearest and most useful
+--        first, reusing measurements from earlier base trees as estimates), searches a cheap additive model of the
+--        score with the moves above, and checks its best trees with full calculations (see "Node value model").
+--        Rounds go on while they find better trees or have nodes left to measure.
+--      - When the model rests (failed rounds with nothing left to measure), Refine runs on the best tree until its
+--        first improving move, so the model gets its turn on the better tree; at a local optimum, far swaps then
+--        random perturbation, each followed by Refine.
 --
 local m_max = math.max
 local m_min = math.min
@@ -81,6 +85,9 @@ function TreeOptimizer.new(build, options)
 	self.shouldStop = options.shouldStop
 	self.useFullDPS = true
 	self.useModel = options.useModel ~= false
+	-- Keep the values the model needs from every calculation, so trees the search has calculated anyway (e.g. a
+	-- branch removed by Refine) serve as model measurements for free
+	self.captureFields = self.useModel
 	-- Seeded generator so runs are reproducible
 	local seed = options.seed or 1
 	self.random = function(lo, hi)
@@ -672,6 +679,11 @@ function TreeOptimizer:Evaluate(state)
 	if (self.shouldStop and self.shouldStop()) or self.evalCount >= self.maxEvals then
 		self.stopped = true
 	end
+	-- Past the time limit, every search loop winds down the same way as when stopped
+	if not self.stopped and self.deadline and now() >= self.deadline then
+		self.stopped = true
+		self.timeUp = true
+	end
 	return result
 end
 
@@ -748,8 +760,151 @@ end
 
 -- Branches: removing a node also removes everything only connected through it
 
+-- What removing each node cuts off, from one depth-first pass over the tree instead of one search per node (Tarjan's
+-- articulation points): removing a node cuts off itself and each of its DFS subtrees with no link to a node above it.
+-- Masteries are left out of the pass, since paths can't continue from them; one is cut off when all of its allocated
+-- neighbours are. Returns nil when the pass doesn't apply (Intuitive Leap-likes, or a tree not fully connected).
+function TreeOptimizer:BranchCuts(state)
+	if self.leapNodes[1] then
+		return nil
+	end
+	local nodes = state.nodes
+	local specNodes = self.spec.nodes
+	local rootId = self.root.id
+	local disc, low, parent, children = { [rootId] = 0 }, { [rootId] = 0 }, { }, { [rootId] = { } }
+	local finished = { }
+	local count = 0
+	local stack = { { node = self.root, i = 1 } }
+	while stack[1] do
+		local top = stack[#stack]
+		local node = top.node
+		local other = node.linked[top.i]
+		if other then
+			top.i = top.i + 1
+			local id = other.id
+			if nodes[id] and other.type ~= "Mastery" then
+				if not disc[id] then
+					count = count + 1
+					disc[id], low[id], parent[id], children[id] = count, count, node.id, { }
+					t_insert(children[node.id], id)
+					t_insert(stack, { node = other, i = 1 })
+				elseif id ~= parent[node.id] and disc[id] < low[node.id] then
+					low[node.id] = disc[id]
+				end
+			end
+		else
+			stack[#stack] = nil
+			local p = parent[node.id]
+			if p and low[node.id] < low[p] then
+				low[p] = low[node.id]
+			end
+			t_insert(finished, node.id)
+		end
+	end
+	local masteries = { }
+	for id in pairs(nodes) do
+		if specNodes[id].type == "Mastery" then
+			-- Allocated neighbours a mastery hangs off
+			local neighbours = { }
+			for _, other in ipairs(specNodes[id].linked) do
+				if disc[other.id] and other.id ~= rootId then
+					t_insert(neighbours, other.id)
+				end
+			end
+			if not neighbours[1] then
+				return nil
+			end
+			masteries[id] = neighbours
+		elseif not disc[id] then
+			return nil
+		end
+	end
+	-- Size and number of must-haves of each DFS subtree, children before parents
+	local size, must = { }, { }
+	for _, id in ipairs(finished) do
+		if id ~= rootId then
+			local s, m = 1, self.mustHave[id] and 1 or 0
+			for _, child in ipairs(children[id]) do
+				s, m = s + size[child], m + must[child]
+			end
+			size[id], must[id] = s, m
+		end
+	end
+	return { disc = disc, low = low, children = children, size = size, must = must, masteries = masteries }
+end
+
 -- Returns a list of { ids = {...}, size = n } for every node whose branch can be removed
 function TreeOptimizer:RemovableBranches(state, maxSize)
+	local cuts = self:BranchCuts(state)
+	if cuts then
+		local branches = { }
+		local disc, low, children, size, must = cuts.disc, cuts.low, cuts.children, cuts.size, cuts.must
+		-- Masteries next to each node
+		local masteriesNear = { }
+		for masteryId, neighbours in pairs(cuts.masteries) do
+			if not self.mustHave[masteryId] then
+				t_insert(branches, { key = masteryId, ids = { masteryId }, size = 1 })
+			end
+			for _, id in ipairs(neighbours) do
+				masteriesNear[id] = masteriesNear[id] or { }
+				t_insert(masteriesNear[id], masteryId)
+			end
+		end
+		for id in pairs(state.nodes) do
+			if not self.mustHave[id] and not cuts.masteries[id] then
+				local total, mustCut = 1, 0
+				for _, child in ipairs(children[id]) do
+					if low[child] >= disc[id] then
+						total, mustCut = total + size[child], mustCut + must[child]
+					end
+				end
+				if total <= maxSize and mustCut == 0 then
+					local ids, inCut = { id }, { [id] = true }
+					for _, child in ipairs(children[id]) do
+						if low[child] >= disc[id] then
+							local walk = { child }
+							while walk[1] do
+								local nodeId = walk[#walk]
+								walk[#walk] = nil
+								t_insert(ids, nodeId)
+								inCut[nodeId] = true
+								for _, grandchild in ipairs(children[nodeId]) do
+									t_insert(walk, grandchild)
+								end
+							end
+						end
+					end
+					-- Masteries cut off along with the branch
+					local valid = true
+					for i = 1, #ids do
+						for _, masteryId in ipairs(masteriesNear[ids[i]] or { }) do
+							if not inCut[masteryId] then
+								local cut = true
+								for _, neighbour in ipairs(cuts.masteries[masteryId]) do
+									if not inCut[neighbour] then
+										cut = false
+										break
+									end
+								end
+								if cut then
+									if self.mustHave[masteryId] or #ids >= maxSize then
+										valid = false
+									end
+									t_insert(ids, masteryId)
+									inCut[masteryId] = true
+								end
+							end
+						end
+					end
+					if valid then
+						t_insert(branches, { key = id, ids = ids, size = #ids })
+					end
+				end
+			end
+		end
+		t_sort(branches, function(a, b) return a.key < b.key end)
+		return branches
+	end
 	local branches = { }
 	for id in pairs(state.nodes) do
 		if not self.mustHave[id] then
@@ -909,9 +1064,10 @@ function TreeOptimizer:Fill(state, budget, banned)
 	return state
 end
 
--- Phase 5: refine by removing a branch and refilling without it
+-- Phase 5: refine by removing a branch and refilling without it. With `once`, returns after the first improving move
+-- (so the caller can take its turn on the better tree), otherwise at a local optimum.
 
-function TreeOptimizer:Refine(state, budget, deadline)
+function TreeOptimizer:Refine(state, budget, deadline, once)
 	local tried = { }
 	-- Loss per point of removing each branch, from the last time it was evaluated. Removing a branch elsewhere
 	-- in the tree rarely changes another branch's value much, so stale losses are good enough for ordering.
@@ -924,7 +1080,9 @@ function TreeOptimizer:Refine(state, budget, deadline)
 		return trial
 	end
 	local improved = true
-	while improved and not self.stopped and now() < deadline do
+	local passes = 0
+	while improved and not self.stopped and now() < deadline and not (once and passes > 0) do
+		passes = passes + 1
 		improved = false
 		local base = self:Evaluate(state)
 		local branches = self:RemovableBranches(state, self.maxBranchSize)
@@ -1159,12 +1317,20 @@ end
 
 -- Node value model
 --
--- A full calculation takes 10-25 ms, which limits the search to tens of thousands of trees. The model measures every
--- node near a base tree once (one calculation each: the calculator doesn't need nodes to be connected) and predicts any
--- tree as the base plus the sum of its changed nodes' effects, on the log of the stat and on every value the
--- constraints read. Predictions take microseconds, so the usual moves can search the model exhaustively; the trees it
--- picks are then checked with a full calculation. Measured on real builds, predictions stay within ~1% for trees up to
--- ~20 changed nodes and degrade gradually further out, mostly where stats interact (crit, conversion, thresholds).
+-- A full calculation takes 10-25 ms, which limits the search to tens of thousands of trees. The model measures what
+-- each node near a base tree is worth on its own (one calculation each: the calculator doesn't need nodes to be
+-- connected) and predicts any tree as the base plus the summed effects of the nodes it adds, minus those of the nodes
+-- it drops, on the log of the stat and on every value the constraints read. Predictions take microseconds, so the
+-- usual moves can search the model exhaustively; the trees it picks are then checked with full calculations. Measured
+-- on real builds, predictions stay within ~1% for trees up to ~20 changed nodes and degrade gradually further out,
+-- mostly where stats interact (crit, conversion, thresholds).
+--
+-- The model is built incrementally and kept for the whole run. Each round measures one more chunk, nearest and most
+-- useful first (dropping allocated nodes, then unallocated nodes one step out, then further), then searches what is
+-- known and checks its best trees, so the first improvements come after a few hundred calculations instead of
+-- after measuring everything. When the best tree changes, the measured effects carry over as estimates (a node's
+-- effect rarely changes much when other parts of the tree change) and are re-measured on the new tree over the
+-- following rounds.
 
 -- How far from the base tree unallocated nodes are measured, and unallocated masteries (every effect costs a
 -- calculation, and a mastery further out rarely makes the difference)
@@ -1172,10 +1338,22 @@ local MODEL_RADIUS = 6
 local MODEL_MASTERY_RADIUS = 2
 -- Distinct trees found on the model that are checked with full calculations per round
 local MODEL_CHECKS = 6
--- Seconds the search on the model may take per round
+-- Seconds the search on the model may take per round: a share of the time the round spent measuring, within limits.
+-- It stops earlier once it has gone MODEL_SEARCH_STALL seconds (or as long as it took to find its best tree, if
+-- longer) without finding a better tree.
 local MODEL_SEARCH_TIME = 5
--- Model rounds pause after this many fail in a row, until the best tree has moved on (see Run)
-local MODEL_MAX_FAILURES = 2
+local MODEL_SEARCH_MIN = 0.5
+local MODEL_SEARCH_SHARE = 0.25
+local MODEL_SEARCH_STALL = 0.5
+-- Calculations the first round spends measuring (it then finishes the distance band it is in), and how much more
+-- each following round may spend
+local MODEL_CHUNK_MIN = 150
+local MODEL_CHUNK_GROWTH = 8
+-- Measurements made on an earlier base tree are redone only after everything within MODEL_RADIUS has been measured
+-- (they're queued this many distance bands further out): measuring further out finds far more than refreshing
+local MODEL_STALE_DELAY = 100
+-- Model rounds rest after this many fail in a row, or one fails with nothing left to measure, until the best tree changes
+local MODEL_MAX_FAILURES = 3
 
 -- Effect of moving from `base` to `eval` on the modelled values
 local function fieldDelta(base, fields)
@@ -1193,77 +1371,198 @@ local function fieldDelta(base, fields)
 	return delta
 end
 
--- Measures the model around `base`: removing each allocated node, switching each allocated mastery to each other
--- effect, and adding each eligible node (and mastery effect) within MODEL_RADIUS. Returns nil if stopped part way.
-function TreeOptimizer:BuildModel(base)
-	self.captureFields = true
-	local function measure(state)
-		-- Cached results from before capturing started have no fields; recalculate those
-		local key = stateKey(state)
-		if self.scoreCache[key] and not self.scoreCache[key].fields then
-			self.scoreCache[key] = nil
-		end
-		state.eval = nil
-		return self:Evaluate(state).fields
-	end
-	-- add/switch are keyed by node id, or "id:effect" for masteries; measured[id] marks unallocated nodes with a value
-	local model = { base = base, add = { }, remove = { }, switch = { }, measured = { } }
-	model.baseFields = measure(self:CopyState(base))
-	local function record(list, key, state)
-		if not self.stopped then
-			list[key] = fieldDelta(model.baseFields, measure(state))
+-- Number of nodes that differ between two trees (a mastery effect switch counts as one)
+local function changedNodes(a, b)
+	local count = 0
+	for id in pairs(a.nodes) do
+		if not b.nodes[id] or a.mastery[id] ~= b.mastery[id] then
+			count = count + 1
 		end
 	end
-	local ids = { }
-	for id in pairs(base.nodes) do
-		t_insert(ids, id)
+	for id in pairs(b.nodes) do
+		if not a.nodes[id] then
+			count = count + 1
+		end
 	end
-	t_sort(ids)
-	for _, id in ipairs(ids) do
+	return count
+end
+
+-- Model entries are keyed like stateKey: the node id, or "id:effect" for a mastery with an effect
+local function nodeKey(id, effectId)
+	return effectId and (id .. ":" .. effectId) or id
+end
+
+-- The model: `with[key]` = { delta = effect of having the node (with that mastery effect) rather than not, version =
+-- base it was measured on }; `known[id]` marks nodes with at least one entry; `suspect[key]` marks stale entries that
+-- a failed check used, to be re-measured first
+function TreeOptimizer:NewModel()
+	return { version = 0, with = { }, known = { }, suspect = { }, bases = { }, drift = { } }
+end
+
+-- Moves the model's base to `base`, keeping every measurement as an estimate
+function TreeOptimizer:RebaseModel(model, base)
+	model.version = model.version + 1
+	model.base = self:CopyState(base)
+	model.baseKey = stateKey(base)
+	model.baseFields = self:Evaluate(model.base).fields
+	model.bases[model.version] = model.base
+	model.drift = { [model.version] = 0 }
+	model.shared = { }
+	model.searched = false
+end
+
+-- Nodes changed between the base an entry was measured on and the current base
+function TreeOptimizer:ModelDrift(model, version)
+	if not model.drift[version] then
+		model.drift[version] = changedNodes(model.bases[version], model.base)
+	end
+	return model.drift[version]
+end
+
+-- Measurements still wanted around the model's base, in the order to make them: suspects, then by distance band
+-- (0: dropping each allocated node, 1: other effects of allocated masteries and unallocated nodes next to the tree, and
+-- so on), with unmeasured entries before stale ones a few bands nearer
+function TreeOptimizer:ModelTasks(model)
+	local base = model.base
+	local tasks = { }
+	local function want(id, effectId, band)
+		local key = nodeKey(id, effectId)
+		local entry = model.with[key]
+		local priority = band
+		if entry then
+			if self:ModelDrift(model, entry.version) == 0 then
+				return
+			end
+			priority = model.suspect[key] and -1 or (band + MODEL_STALE_DELAY)
+		end
+		t_insert(tasks, { key = key, id = id, effectId = effectId, priority = priority })
+	end
+	-- Must-haves are never dropped or switched by the search
+	for id, node in pairs(base.nodes) do
 		if not self.mustHave[id] then
-			local trial = self:CopyState(base)
-			self:RemoveNode(trial, id)
-			record(model.remove, id, trial)
-		end
-		local node = self.spec.nodes[id]
-		if node.type == "Mastery" then
-			for _, effectId in ipairs(self:AvailableEffects(base, node)) do
-				if effectId ~= base.mastery[id] then
-					local trial = self:CopyState(base)
-					self:RemoveNode(trial, id)
-					self:AddNode(trial, node, effectId)
-					record(model.switch, id .. ":" .. effectId, trial)
+			want(id, base.mastery[id], 0)
+			if node.type == "Mastery" then
+				for _, effectId in ipairs(self:AvailableEffects(base, node)) do
+					if effectId ~= base.mastery[id] then
+						want(id, effectId, 1)
+					end
 				end
 			end
 		end
 	end
 	local dist = self:Frontier(base, MODEL_RADIUS)
-	ids = { }
-	for id in pairs(dist) do
-		t_insert(ids, id)
-	end
-	t_sort(ids)
-	for _, id in ipairs(ids) do
+	for id, d in pairs(dist) do
 		local node = self.spec.nodes[id]
 		if node.type == "Mastery" then
-			if dist[id] <= MODEL_MASTERY_RADIUS then
+			if d <= MODEL_MASTERY_RADIUS then
 				for _, effectId in ipairs(self:AvailableEffects(base, node)) do
-					local trial = self:CopyState(base)
-					self:AddNode(trial, node, effectId)
-					record(model.add, id .. ":" .. effectId, trial)
-					model.measured[id] = true
+					want(id, effectId, d + 1)
 				end
 			end
 		else
-			local trial = self:CopyState(base)
-			self:AddNode(trial, node)
-			record(model.add, id, trial)
-			model.measured[id] = true
+			want(id, nil, d)
 		end
 	end
-	self.captureFields = false
-	if self.stopped then
+	t_sort(tasks, function(a, b)
+		if a.priority ~= b.priority then
+			return a.priority < b.priority
+		end
+		return tostring(a.key) < tostring(b.key)
+	end)
+	return tasks
+end
+
+-- Nodes whose effect may depend on where they are: those in the radius of a socketed jewel (radius jewels change or
+-- count the nodes around them) or conquered by a timeless jewel, and jewel sockets
+function TreeOptimizer:PositionDependent(id)
+	if not self.positionDependent then
+		local set = copyTable(self.conqueredBySocket, true)
+		for socketId, itemId in pairs(self.spec.jewels) do
+			local socket = self.spec.nodes[socketId]
+			local item = self.build.itemsTab.items[itemId]
+			if socket and item and item.jewelRadiusIndex and socket.nodesInRadius then
+				for nodeId in pairs(socket.nodesInRadius[item.jewelRadiusIndex] or { }) do
+					set[nodeId] = true
+				end
+			end
+		end
+		self.positionDependent = set
+	end
+	local node = self.spec.nodes[id]
+	return self.positionDependent[id] or node.type == "Socket" or node.isJewelSocket or node.expansionJewel ~= nil
+end
+
+-- Nodes with the same stats have the same effect wherever they are (unless PositionDependent), so on the same base
+-- tree one measurement serves all of them: travel nodes, cluster small nodes and masteries of the same kind repeat
+-- all over the tree. Returns the key such nodes share, or nil. Allocated and unallocated nodes don't share (dropping
+-- one of several copies isn't worth the same as adding another), nor do effect switches of allocated masteries
+-- (each is measured without that mastery's current effect).
+function TreeOptimizer:ModelSignature(model, task)
+	local id, effectId = task.id, task.effectId
+	if self:PositionDependent(id) then
 		return nil
+	end
+	local side = model.base.nodes[id] and "in" or "out"
+	if effectId then
+		if model.base.nodes[id] and effectId ~= model.base.mastery[id] then
+			return nil
+		end
+		return side .. ":mastery:" .. effectId
+	end
+	local node = self.spec.nodes[id]
+	return side .. ":" .. tostring(node.type) .. ":" .. t_concat(node.sd or { }, "\n")
+end
+
+-- Measures one entry on the model's base: the base with and without the node. One side is the base itself, except
+-- when switching an allocated mastery, whose "without" side is shared by all its effects.
+function TreeOptimizer:MeasureModelTask(model, task)
+	local base = model.base
+	local id, effectId = task.id, task.effectId
+	local signature = self:ModelSignature(model, task)
+	local shared = signature and model.shared[signature]
+	if shared then
+		model.with[task.key] = { delta = shared, version = model.version }
+		model.known[id] = true
+		model.suspect[task.key] = nil
+		model.searched = false
+		return
+	end
+	local withState, withoutState
+	if base.nodes[id] then
+		withoutState = self:CopyState(base)
+		self:RemoveNode(withoutState, id)
+		if effectId == base.mastery[id] then
+			withState = base
+		else
+			withState = self:CopyState(withoutState)
+			self:AddNode(withState, self.spec.nodes[id], effectId)
+		end
+	else
+		withoutState = base
+		withState = self:CopyState(base)
+		self:AddNode(withState, self.spec.nodes[id], effectId)
+	end
+	local withFields = self:Evaluate(withState).fields
+	local withoutFields = self:Evaluate(withoutState).fields
+	local delta = fieldDelta(withoutFields, withFields)
+	if signature then
+		model.shared[signature] = delta
+	end
+	model.with[task.key] = { delta = delta, version = model.version }
+	model.known[id] = true
+	model.suspect[task.key] = nil
+	model.searched = false
+end
+
+-- Measures the whole model around `base` (or until `deadline`). Returns nil if stopped part way.
+function TreeOptimizer:BuildModel(base, deadline)
+	local model = self:NewModel()
+	self:RebaseModel(model, base)
+	for _, task in ipairs(self:ModelTasks(model)) do
+		if self.stopped or (deadline and now() >= deadline) then
+			return nil
+		end
+		self:MeasureModelTask(model, task)
 	end
 	return model
 end
@@ -1287,66 +1586,107 @@ end
 -- Predicted values (log of the stat and everything the constraints read) of `state`, relative to the measured base
 function TreeOptimizer:ModelFields(model, state)
 	local base = model.base
+	local with = model.with
 	local fields = copyTable(model.baseFields, true)
-	local function apply(delta)
-		for key, value in pairs(delta) do
-			fields[key] = (fields[key] or 0) + value
+	local function apply(key, sign)
+		local entry = with[key]
+		if not entry then
+			return false
 		end
+		for field, value in pairs(entry.delta) do
+			fields[field] = (fields[field] or 0) + sign * value
+		end
+		return true
 	end
 	for id in pairs(state.nodes) do
-		local key = state.mastery[id] and (id .. ":" .. state.mastery[id]) or id
-		local delta
+		local effectId = state.mastery[id]
 		if not base.nodes[id] then
-			delta = model.add[key]
-		elseif state.mastery[id] and state.mastery[id] ~= base.mastery[id] then
-			delta = model.switch[key]
-		end
-		if delta then
-			apply(delta)
-		elseif not base.nodes[id] or (state.mastery[id] and state.mastery[id] ~= base.mastery[id]) then
-			return nil
+			if not apply(nodeKey(id, effectId), 1) then
+				return nil
+			end
+		elseif effectId ~= base.mastery[id] then
+			if not apply(nodeKey(id, effectId), 1) or not apply(nodeKey(id, base.mastery[id]), -1) then
+				return nil
+			end
 		end
 	end
 	for id in pairs(base.nodes) do
-		if not state.nodes[id] then
-			if not model.remove[id] then
-				return nil
-			end
-			apply(model.remove[id])
+		if not state.nodes[id] and not apply(nodeKey(id, base.mastery[id]), -1) then
+			return nil
 		end
 	end
 	return fields
 end
 
--- Number of nodes that differ between two trees (a mastery effect switch counts as one)
-local function changedNodes(a, b)
-	local count = 0
-	for id in pairs(a.nodes) do
-		if not b.nodes[id] or a.mastery[id] ~= b.mastery[id] then
-			count = count + 1
+-- Keys of the entries ModelFields uses to predict `state`
+local function changedKeys(base, state)
+	local keys = { }
+	for id in pairs(state.nodes) do
+		local effectId = state.mastery[id]
+		if not base.nodes[id] or effectId ~= base.mastery[id] then
+			t_insert(keys, nodeKey(id, effectId))
+			if base.nodes[id] then
+				t_insert(keys, nodeKey(id, base.mastery[id]))
+			end
 		end
 	end
-	for id in pairs(b.nodes) do
-		if not a.nodes[id] then
-			count = count + 1
+	for id in pairs(base.nodes) do
+		if not state.nodes[id] then
+			t_insert(keys, nodeKey(id, base.mastery[id]))
 		end
 	end
-	return count
+	return keys
 end
 
--- One model round around the best tree: measure the model, search it with the usual moves, then check the most
--- promising trees it found with full calculations. Returns the best of those if it really beats the base, else nil.
+-- One model round around the best tree: measure the next chunk of the model, search what it knows with the usual
+-- moves, then check the most promising trees it found with full calculations. Returns the best of those if it really
+-- beats the base, else nil, and whether measurements are still pending around the base.
 function TreeOptimizer:ModelRound(deadline)
-	local base = self:CopyState(self.best)
-	local baseEval = self:Evaluate(base)
-	self.phase = "node values"
-	local model = self:BuildModel(base)
-	if not model or now() >= deadline then
-		return nil
+	local model = self.model
+	if not model then
+		model = self:NewModel()
+		self.model = model
 	end
+	if model.baseKey ~= stateKey(self.best) then
+		self:RebaseModel(model, self.best)
+	end
+	local base = model.base
+	local baseEval = self:Evaluate(base)
+
+	-- Measure the next chunk, finishing the distance band it is in once past the chunk size. Chunks grow
+	-- geometrically: the first gives a quick first search, the next ones cover the rest of the model.
+	self.phase = "node values"
+	local tasks = self:ModelTasks(model)
+	local startEvals = self.evalCount
+	local measureStart = now()
+	local chunk = MODEL_CHUNK_MIN * MODEL_CHUNK_GROWTH ^ (model.chunks or 0)
+	local done = 0
+	for i, task in ipairs(tasks) do
+		local spent = self.evalCount - startEvals
+		if self.stopped or now() >= deadline
+			or (spent >= chunk and math.floor(task.priority) ~= math.floor(tasks[i - 1].priority)) then
+			break
+		end
+		self:MeasureModelTask(model, task)
+		done = i
+	end
+	if self.evalCount > startEvals then
+		model.chunks = (model.chunks or 0) + 1
+	end
+	local measureTime = now() - measureStart
+	local pending = #tasks > done
+	if self.stopped or now() >= deadline or model.searched then
+		return nil, pending
+	end
+	model.searched = true
+
 	-- A copy of the optimizer that scores trees with the model. It shares the graph and settings, but has its own
 	-- caches and bookkeeping so nothing predicted leaks into the real search.
 	self.phase = "model search"
+	local searchStart = now()
+	local searchTime = m_max(MODEL_SEARCH_MIN, MODEL_SEARCH_SHARE * measureTime)
+	local searchDeadline = m_min(deadline, searchStart + m_min(searchTime, MODEL_SEARCH_TIME))
+	local startTime, lastFound, startDeadline = searchStart, searchStart, searchDeadline
 	local unknown = { score = -math.huge, deficit = math.huge, value = 0, attributes = { }, violations = { } }
 	local proxy = setmetatable({
 		scoreCache = { }, estimates = { }, farEstimates = { }, farTried = { }, farFailures = { }, stopped = false,
@@ -1356,13 +1696,18 @@ function TreeOptimizer:ModelRound(deadline)
 		if not state.eval then
 			state.eval = self:ModelEvaluate(model, state) or unknown
 			predictions = predictions + 1
-			-- Predictions don't go through the real Evaluate, so report progress (letting the UI run) and honour Stop here
+			-- Predictions don't go through the real Evaluate, so report progress (letting the UI run) and honour Stop here.
+			-- The search also ends once it stops finding better trees.
 			if predictions % 50 == 0 then
 				if self.onProgress then
 					self.onProgress({ phase = self.phase, evals = self.evalCount, best = self.best and self.best.eval, elapsed = now() - self.startTime, timeLimit = self.timeLimit })
 				end
 				if self.shouldStop and self.shouldStop() then
 					self.stopped = true
+					p.stopped = true
+				end
+				local t = now()
+				if t >= startDeadline or t - lastFound > m_max(MODEL_SEARCH_STALL, lastFound - startTime) then
 					p.stopped = true
 				end
 			end
@@ -1373,10 +1718,11 @@ function TreeOptimizer:ModelRound(deadline)
 		if not self:IsEligible(node) then
 			return false
 		end
-		return base.nodes[node.id] ~= nil or model.measured[node.id] == true
+		return base.nodes[node.id] ~= nil or model.known[node.id] == true
 	end
 	-- Candidates for checking: the best predicted tree within each distance of the base (predictions are most
-	-- reliable near the base), and the best distinct trees overall
+	-- reliable near the base), and the best distinct trees overall. Trees already calculated count with their real
+	-- score, so the search doesn't keep returning trees that failed their check.
 	local bestWithin = { }
 	local limits = { 5, 10, 20, math.huge }
 	local top = { }
@@ -1388,16 +1734,24 @@ function TreeOptimizer:ModelRound(deadline)
 		if state.count > self.points or not self:IsBetter(eval, baseEval) then
 			return
 		end
+		local key = stateKey(state)
+		local real = self.scoreCache[key]
+		if real then
+			if not self:IsBetter(real, baseEval) then
+				return
+			end
+			eval = real
+		end
 		local changed = changedNodes(state, base)
 		local entry
 		for i, limit in ipairs(limits) do
 			if changed <= limit and (not bestWithin[i] or self:IsBetter(eval, bestWithin[i].eval)) then
-				entry = entry or { state = p:CopyState(state), eval = eval, key = stateKey(state) }
+				entry = entry or { state = p:CopyState(state), eval = eval, key = key }
 				bestWithin[i] = entry
+				lastFound = now()
 			end
 		end
 		if #top < MODEL_CHECKS or self:IsBetter(eval, top[#top].eval) then
-			local key = stateKey(state)
 			for _, other in ipairs(top) do
 				if other.key == key then
 					return
@@ -1406,25 +1760,41 @@ function TreeOptimizer:ModelRound(deadline)
 			t_insert(top, entry or { state = p:CopyState(state), eval = eval, key = key })
 			t_sort(top, better)
 			top[MODEL_CHECKS + 1] = nil
+			lastFound = now()
 		end
 	end
 
-	-- Search the model: refine from the base, then perturb and refine (predictions are cheap, so this explores far
-	-- more than the real search can)
-	local searchDeadline = m_min(deadline, now() + MODEL_SEARCH_TIME)
-	local trial = proxy:CopyState(base)
-	trial.eval = nil
-	proxy:Fill(trial, self.points)
-	local current = proxy:Refine(trial, self.points, searchDeadline)
-	while not proxy.stopped and now() < searchDeadline do
-		local perturbed = proxy:Perturb(current, self.points)
-		perturbed = proxy:Refine(perturbed, self.points, searchDeadline)
-		if self:IsBetter(proxy:Evaluate(perturbed), proxy:Evaluate(current)) then
-			current = perturbed
+	-- Search the model: refine from a start tree, then perturb and refine (predictions are cheap, so this explores far
+	-- more than the real search can). The search starts from the base, then from the tree the run started from: the
+	-- first rounds only know the nodes next to the tree, and the small improvements they find can lead into a worse
+	-- basin than the one a search of the whole model finds from the start tree.
+	local starts = { base }
+	if self.startState and stateKey(self.startState) ~= model.baseKey then
+		t_insert(starts, self.startState)
+	end
+	for i, start in ipairs(starts) do
+		if self.stopped then
+			break
+		end
+		proxy.stopped = false
+		startTime = now()
+		lastFound = startTime
+		startDeadline = m_min(searchDeadline, startTime + (searchDeadline - startTime) / (#starts - i + 1))
+		local trial = proxy:CopyState(start)
+		trial.eval = nil
+		proxy:Fill(trial, self.points)
+		local current = proxy:Refine(trial, self.points, startDeadline)
+		while not proxy.stopped and now() < startDeadline do
+			local perturbed = proxy:Perturb(current, self.points)
+			perturbed = proxy:Refine(perturbed, self.points, startDeadline)
+			if self:IsBetter(proxy:Evaluate(perturbed), proxy:Evaluate(current)) then
+				current = perturbed
+			end
 		end
 	end
 
-	-- Check candidates with full calculations, nearest to the base first
+	-- Check candidates with full calculations, nearest to the base first. Stale entries behind a failed prediction
+	-- are re-measured first in the next round.
 	self.phase = "model check"
 	local candidates = { }
 	for i = 1, #limits do
@@ -1450,10 +1820,18 @@ function TreeOptimizer:ModelRound(deadline)
 			self:Track(state)
 			if self:IsBetter(eval, bestEval or baseEval) then
 				bestState, bestEval = state, eval
+			elseif not self:IsBetter(eval, baseEval) then
+				for _, key in ipairs(changedKeys(base, state)) do
+					local entry = model.with[key]
+					if entry and entry.version ~= model.version then
+						model.suspect[key] = true
+						pending = true
+					end
+				end
 			end
 		end
 	end
-	return bestState
+	return bestState, pending
 end
 
 -- Removes a few random branches from `state` and refills without them, to escape a local optimum
@@ -1521,51 +1899,66 @@ function TreeOptimizer:Run()
 	self:Fill(state, self.points)
 	self:Track(state)
 	local afterFill = self:CopyState(state)
+	self.startState = afterFill
 	local fillTime = now() - startTime
 	local fillEvals = self.evalCount
 
 	-- The time limit covers the whole run; the fill always completes so there is a full tree to return
 	local deadline = startTime + self.timeLimit
+	self.deadline = deadline
 
-	-- Phase 5 until time runs out: model rounds, refine, then far swaps / perturbation and refine again (iterated local
-	-- search). Model rounds and the real search find different improvements, so they alternate: a round runs first, again
-	-- straight after every successful round (once its result is refined), and otherwise whenever the search has moved the
-	-- best tree on by 1% since the last round. Rounds stop for the run after MODEL_MAX_FAILURES fail in a row.
-	local modelRounds, modelFailures, modelScore, modelSucceeded = 0, 0, nil, false
+	-- Phase 5 until time runs out. Model rounds come first and keep going while they find better trees or have
+	-- measurements left to make. When one fails with nothing left to measure, or MODEL_MAX_FAILURES fail in a row, the
+	-- model rests until the best tree changes and the real search takes over: Refine the best tree until its first
+	-- improving move (then the model gets its turn on the new tree) or a local optimum, and from a local optimum, far
+	-- swaps / perturbation followed by Refine (iterated local search).
+	local modelRounds, modelFailures, modelRestingAt = 0, 0, nil
 	local localOptima = 0
+	local refinedKey
 	local bestLosses, bestLossesFor = { }, nil
 	while not self.stopped and now() < deadline do
-		local trial
-		if self.useModel and modelFailures < MODEL_MAX_FAILURES and (modelSucceeded or not modelScore or self.best.eval.score > modelScore + 0.01) then
+		local bestKey = stateKey(self.best)
+		if self.useModel and modelRestingAt ~= bestKey then
 			modelRounds = modelRounds + 1
-			modelScore = self.best.eval.score
-			trial = self:ModelRound(deadline)
-			modelSucceeded = trial ~= nil
-			modelFailures = trial and 0 or (modelFailures + 1)
-		end
-		if not trial and localOptima == 0 then
-			-- Refine the filled tree itself first
-			trial = self:CopyState(self.best)
-		end
-		if not trial and not self.stopped then
+			local found, pending = self:ModelRound(deadline)
+			if found then
+				modelFailures = 0
+			else
+				modelFailures = modelFailures + 1
+				if not pending or modelFailures >= MODEL_MAX_FAILURES then
+					modelRestingAt = stateKey(self.best)
+					modelFailures = 0
+				end
+			end
+		elseif refinedKey ~= bestKey then
+			self.phase = "refine"
+			local trial = self:Refine(self:CopyState(self.best), self.points, deadline, true)
+			self:Track(trial)
+			state = trial
+			if stateKey(self.best) == bestKey and not self.stopped and now() < deadline then
+				-- Nothing improved the best tree: it is a local optimum
+				refinedKey = bestKey
+				localOptima = localOptima + 1
+			end
+		else
 			-- Work through far targets on the best tree first (each call tries ones not yet tried on it), then fall back
 			-- to random perturbation once they run out
 			if bestLossesFor ~= self.best then
 				bestLosses, bestLossesFor = { }, self.best
 			end
 			self.phase = "far swap"
-			trial = self:FarSwap(self.best, self.points, self:BranchLossFunction(bestLosses))
+			local trial = self:FarSwap(self.best, self.points, self:BranchLossFunction(bestLosses))
 			if not trial and not self.stopped then
 				self.phase = "perturb"
 				trial = self:Perturb(self.best, self.points)
 			end
-		end
-		if trial then
-			self.phase = "refine"
-			trial = self:Refine(trial, self.points, deadline)
-			self:Track(trial)
-			state = trial
-			localOptima = localOptima + 1
+			if trial and not self.stopped then
+				self.phase = "refine"
+				trial = self:Refine(trial, self.points, deadline)
+				self:Track(trial)
+				state = trial
+				localOptima = localOptima + 1
+			end
 		end
 	end
 
@@ -1584,7 +1977,7 @@ function TreeOptimizer:Run()
 		fillEvals = fillEvals,
 		fillTime = fillTime,
 		time = now() - startTime,
-		stopped = self.stopped,
+		stopped = self.stopped and not self.timeUp,
 	}
 end
 
