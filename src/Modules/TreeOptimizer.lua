@@ -31,6 +31,7 @@
 --
 local m_max = math.max
 local m_min = math.min
+local m_floor = math.floor
 local m_log = math.log
 local t_insert = table.insert
 local t_sort = table.sort
@@ -93,9 +94,9 @@ function TreeOptimizer.new(build, options)
 	self.shouldStop = options.shouldStop
 	self.useFullDPS = true
 	self.useModel = options.useModel ~= false
-	-- Keep the values the model needs from every calculation, so trees the search has calculated anyway (e.g. a
 	self.modelShare = options.modelShare
 	self.modelMeasureShare = options.modelMeasureShare
+	-- Keep the values the model needs from every calculation, so trees the search has calculated anyway (e.g. a
 	-- branch removed by Refine) serve as model measurements for free
 	self.captureFields = self.useModel
 	-- Seeded generator so runs are reproducible
@@ -1509,6 +1510,9 @@ local REPAIR_MASTERY_REACH = 1
 local REPAIR_TRIES = 3
 -- Paths that meet every requirement on their own that are tried as single swaps
 local REPAIR_FIXES = 2
+-- Calculations one greedy step may spend on candidates whose value isn't known yet (nearest first); the rest wait for
+-- the next step. A step that finds nothing within them still looks at every candidate.
+local REPAIR_STEP_EVALS = 40
 
 local function modsMatch(node, needs)
 	for _, mod in ipairs(node.modList or { }) do
@@ -1620,19 +1624,42 @@ function TreeOptimizer:Repair(state, budget)
 				t_insert(candidates, { id = id, node = node, dist = d, effects = effects, signature = self:NodeSignature(node) })
 			end
 		end
-		t_sort(candidates, function(a, b) return a.id < b.id end)
+		t_sort(candidates, function(a, b)
+			if a.dist ~= b.dist then
+				return a.dist < b.dist
+			end
+			return a.id < b.id
+		end)
 		-- Lazy greedy on merit gain per point, as in Fill: re-evaluate the best estimate until it is up to date
 		local accepted
+		local stepEvals, limit = 0, REPAIR_STEP_EVALS
 		while not self.stopped do
 			local best, bestPriority
 			for _, cand in ipairs(candidates) do
 				local est = estimates[cand.id]
 				local priority = est and est.gain or signatureRates[cand.signature] or math.huge
+				if stepEvals >= limit and priority == math.huge then
+					priority = -math.huge
+				end
 				if not cand.done and (not best or priority > bestPriority) then
 					best, bestPriority = cand, priority
 				end
 			end
 			if not best or bestPriority <= EPSILON then
+				-- Nothing helps among the candidates looked at: look at the rest
+				if stepEvals >= limit and not accepted and not self.stopped then
+					local unknown = false
+					for _, cand in ipairs(candidates) do
+						if not cand.done and not estimates[cand.id] and not signatureRates[cand.signature] then
+							unknown = true
+							break
+						end
+					end
+					if unknown then
+						limit = math.huge
+						goto nextCandidate
+					end
+				end
 				break
 			end
 			local est = estimates[best.id]
@@ -1640,6 +1667,7 @@ function TreeOptimizer:Repair(state, budget)
 				accepted = best
 				break
 			end
+			stepEvals = stepEvals + 1
 			local path = self:TargetPath(state, best.node, dist, parent)
 			local trial = self:CopyState(state)
 			for i = #path, 2, -1 do
@@ -1662,6 +1690,7 @@ function TreeOptimizer:Repair(state, budget)
 			if bestEval.deficit == 0 and state == original then
 				t_insert(fixes, { path = path, effectId = bestEffect or nil, gain = gain })
 			end
+			::nextCandidate::
 		end
 		if not accepted then
 			break
@@ -1734,6 +1763,11 @@ local MODEL_CHUNK_GROWTH = 8
 local MODEL_STALE_DELAY = 100
 -- Model rounds rest after this many fail in a row, or one fails with nothing left to measure, until the best tree changes
 local MODEL_MAX_FAILURES = 3
+-- Share of the run the model may use (measuring, searching and checking), and the longest one round may spend measuring,
+-- as a share of the time limit. The rest goes to the real search, which keeps improving long after the model has
+-- measured what is worth measuring.
+local MODEL_SHARE = 0.3
+local MODEL_MEASURE_SHARE = 0.08
 
 -- Effect of moving from `base` to `eval` on the modelled values
 local function fieldDelta(base, fields)
@@ -1763,11 +1797,6 @@ local function changedNodes(a, b)
 		if not a.nodes[id] then
 			count = count + 1
 		end
--- Share of the run the model may use (measuring, searching and checking), and the longest one round may spend measuring,
--- as a share of the time limit. The rest goes to the real search, which keeps improving long after the model has
--- measured what is worth measuring.
-local MODEL_SHARE = 0.3
-local MODEL_MEASURE_SHARE = 0.08
 	end
 	return count
 end
@@ -2221,10 +2250,11 @@ function TreeOptimizer:ModelRound(deadline)
 end
 
 -- Removes a few random branches from `state` and refills without them, to escape a local optimum
-function TreeOptimizer:Perturb(state, budget)
+function TreeOptimizer:Perturb(state, budget, strength)
 	local trial = self:CopyState(state)
 	local banned = { }
-	local count = self.random(2, 4)
+	strength = strength or 2
+	local count = self.random(strength, strength + 2)
 	for _ = 1, count do
 		local branches = self:RemovableBranches(trial, self.maxBranchSize)
 		if not branches[1] then
@@ -2310,6 +2340,12 @@ function TreeOptimizer:Run()
 	local localOptima = 0
 	local refinedKey
 	local bestLosses, bestLossesFor = { }, nil
+	local perturbedFor, perturbFailures
+	local modelTime = 0
+	local modelShare = self.modelShare or MODEL_SHARE
+	-- From scratch, the fill's tree is refined before the model measures anything: the model's measuring is a large
+	-- fixed cost that only pays off on a tree that is already decent
+	local scratchRefined = not self.fromScratch
 	while not self.stopped and now() < deadline do
 		local bestKey = stateKey(self.best)
 		if self.best.eval.deficit > 0 and repaired ~= self.best then
@@ -2328,7 +2364,9 @@ function TreeOptimizer:Run()
 			state = trial
 		elseif self.useModel and modelRestingAt ~= bestKey and modelTime <= modelShare * (now() - startTime) then
 			modelRounds = modelRounds + 1
+			local roundStart = now()
 			local found, pending = self:ModelRound(deadline)
+			modelTime = modelTime + now() - roundStart
 			if found then
 				modelFailures = 0
 			else
@@ -2358,15 +2396,18 @@ function TreeOptimizer:Run()
 			local trial = self:FarSwap(self.best, self.points, self:BranchLossFunction(bestLosses))
 			if not trial and not self.stopped then
 				self.phase = "perturb"
-				trial = self:Perturb(self.best, self.points)
+				-- Kicks that keep failing to lead anywhere better grow, so a deep local optimum is eventually left
+				if perturbedFor ~= self.best then
+					perturbedFor, perturbFailures = self.best, 0
+				end
+				perturbFailures = perturbFailures + 1
+				trial = self:Perturb(self.best, self.points, m_min(2 + m_floor(perturbFailures / 4), 8))
 			end
 			if trial and not self.stopped then
 				self.phase = "refine"
 				trial = self:Refine(trial, self.points, deadline)
 				self:Track(trial)
-			local roundStart = now()
 				state = trial
-			modelTime = modelTime + now() - roundStart
 				localOptima = localOptima + 1
 			end
 		end
