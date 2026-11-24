@@ -94,6 +94,8 @@ function TreeOptimizer.new(build, options)
 	self.useFullDPS = true
 	self.useModel = options.useModel ~= false
 	-- Keep the values the model needs from every calculation, so trees the search has calculated anyway (e.g. a
+	self.modelShare = options.modelShare
+	self.modelMeasureShare = options.modelMeasureShare
 	-- branch removed by Refine) serve as model measurements for free
 	self.captureFields = self.useModel
 	-- Seeded generator so runs are reproducible
@@ -1761,6 +1763,11 @@ local function changedNodes(a, b)
 		if not a.nodes[id] then
 			count = count + 1
 		end
+-- Share of the run the model may use (measuring, searching and checking), and the longest one round may spend measuring,
+-- as a share of the time limit. The rest goes to the real search, which keeps improving long after the model has
+-- measured what is worth measuring.
+local MODEL_SHARE = 0.3
+local MODEL_MEASURE_SHARE = 0.08
 	end
 	return count
 end
@@ -2042,7 +2049,8 @@ function TreeOptimizer:ModelRound(deadline)
 	for i, task in ipairs(tasks) do
 		local spent = self.evalCount - startEvals
 		if self.stopped or now() >= deadline
-			or (spent >= chunk and math.floor(task.priority) ~= math.floor(tasks[i - 1].priority)) then
+			or (spent >= chunk and math.floor(task.priority) ~= math.floor(tasks[i - 1].priority))
+			or (i > 1 and now() - measureStart >= self.timeLimit * (self.modelMeasureShare or MODEL_MEASURE_SHARE)) then
 			break
 		end
 		self:MeasureModelTask(model, task)
@@ -2311,7 +2319,14 @@ function TreeOptimizer:Run()
 			repaired = self.best
 			self:Track(trial)
 			state = trial
-		elseif self.useModel and modelRestingAt ~= bestKey then
+		elseif not scratchRefined then
+			scratchRefined = true
+			self.phase = "refine"
+			local refineDeadline = m_min(deadline, now() + self.timeLimit * 0.25)
+			local trial = self:Refine(self:CopyState(self.best), self.points, refineDeadline)
+			self:Track(trial)
+			state = trial
+		elseif self.useModel and modelRestingAt ~= bestKey and modelTime <= modelShare * (now() - startTime) then
 			modelRounds = modelRounds + 1
 			local found, pending = self:ModelRound(deadline)
 			if found then
@@ -2349,7 +2364,9 @@ function TreeOptimizer:Run()
 				self.phase = "refine"
 				trial = self:Refine(trial, self.points, deadline)
 				self:Track(trial)
+			local roundStart = now()
 				state = trial
+			modelTime = modelTime + now() - roundStart
 				localOptima = localOptima + 1
 			end
 		end
