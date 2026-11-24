@@ -21,13 +21,16 @@
 --   6. Until time runs out (the deadline is checked after every calculation, so Fill, Repair and the model's
 --      measuring stop on time too). The model ranks trees by the same deficit-first IsBetter as the real search:
 --      - A best tree that still misses its requirements gets one Repair before anything else is tried on it.
+--        So does a tree the model found that beats the base's stat but misses a requirement.
 --      - Model rounds first: each measures one more chunk of nodes around the best tree (nearest and most useful
 --        first, reusing measurements from earlier base trees as estimates), searches a cheap additive model of the
 --        score with the moves above, and checks its best trees with full calculations (see "Node value model").
 --        Rounds go on while they find better trees or have nodes left to measure.
 --      - When the model rests (failed rounds with nothing left to measure), Refine runs on the best tree until its
 --        first improving move, so the model gets its turn on the better tree; at a local optimum, far swaps then
---        random perturbation, each followed by Refine.
+--        random perturbation, each followed by Refine. Perturbation alternates between removing a few branches (more
+--        of them the more kicks fail) and removing a whole region around a notable (PerturbRegion). The search on the
+--        model uses the same kicks.
 --
 local m_max = math.max
 local m_min = math.min
@@ -1747,6 +1750,8 @@ local MODEL_RADIUS = 6
 local MODEL_MASTERY_RADIUS = 2
 -- Distinct trees found on the model that are checked with full calculations per round
 local MODEL_CHECKS = 6
+-- Checked trees that miss a requirement and beat the base's stat that get a repair, per round
+local MODEL_REPAIRS = 2
 -- Seconds the search on the model may take per round: a share of the time the round spent measuring, within limits.
 -- It stops earlier once it has gone MODEL_SEARCH_STALL seconds (or as long as it took to find its best tree, if
 -- longer) without finding a better tree.
@@ -2199,11 +2204,20 @@ function TreeOptimizer:ModelRound(deadline)
 		trial.eval = nil
 		proxy:Fill(trial, self.points)
 		local current = proxy:Refine(trial, self.points, startDeadline)
+		local kicks, kickFailures = 0, 0
 		while not proxy.stopped and now() < startDeadline do
-			local perturbed = proxy:Perturb(current, self.points)
+			kicks = kicks + 1
+			local perturbed
+			if kicks % 3 == 0 then
+				perturbed = proxy:PerturbRegion(current, self.points, 2 + m_floor(kicks / 3) % 4)
+			end
+			perturbed = perturbed or proxy:Perturb(current, self.points, m_min(2 + m_floor(kickFailures / 4), 8))
 			perturbed = proxy:Refine(perturbed, self.points, startDeadline)
 			if self:IsBetter(proxy:Evaluate(perturbed), proxy:Evaluate(current)) then
 				current = perturbed
+				kickFailures = 0
+			else
+				kickFailures = kickFailures + 1
 			end
 		end
 	end
@@ -2221,7 +2235,7 @@ function TreeOptimizer:ModelRound(deadline)
 		t_insert(candidates, entry)
 	end
 	local bestState, bestEval
-	local checked, checks = { }, 0
+	local checked, checks, repairs = { }, 0, 0
 	for _, candidate in ipairs(candidates) do
 		if self.stopped or checks >= MODEL_CHECKS then
 			break
@@ -2233,6 +2247,14 @@ function TreeOptimizer:ModelRound(deadline)
 			state.eval = nil
 			local eval = self:Evaluate(state)
 			self:Track(state)
+			-- A tree that is stronger but misses a requirement by a little (the model reads the requirements less
+			-- accurately than the stat) gets a repair
+			if eval.deficit > 0 and baseEval.deficit == 0 and eval.value > baseEval.value and repairs < MODEL_REPAIRS then
+				repairs = repairs + 1
+				state = self:Repair(state, self.points)
+				eval = self:Evaluate(state)
+				self:Track(state)
+			end
 			if self:IsBetter(eval, bestEval or baseEval) then
 				bestState, bestEval = state, eval
 			elseif not self:IsBetter(eval, baseEval) then
@@ -2265,6 +2287,51 @@ function TreeOptimizer:Perturb(state, budget, strength)
 			self:RemoveNode(trial, id)
 			banned[id] = true
 		end
+	end
+	self:Fill(trial, budget, banned)
+	self:Fill(trial, budget)
+	return trial
+end
+
+-- Removes every allocated node within `radius` links of a random allocated notable (a whole region of the tree, which
+-- Perturb's small branches can't do), then refills without those nodes. Returns nil if the must-haves can't be kept.
+function TreeOptimizer:PerturbRegion(state, budget, radius)
+	local trial = self:CopyState(state)
+	local centres = { }
+	for id, node in pairs(trial.nodes) do
+		if (node.type == "Notable" or node.type == "Keystone") and not self.mustHave[id] then
+			t_insert(centres, id)
+		end
+	end
+	if not centres[1] then
+		return nil
+	end
+	t_sort(centres)
+	local centre = self.spec.nodes[centres[self.random(1, #centres)]]
+	local dist = { [centre.id] = 0 }
+	local queue = { centre }
+	local head = 1
+	local banned = { }
+	while queue[head] do
+		local node = queue[head]
+		head = head + 1
+		local id = node.id
+		if trial.nodes[id] and not self.mustHave[id] then
+			self:RemoveNode(trial, id)
+			banned[id] = true
+		end
+		if dist[id] < radius then
+			for _, other in ipairs(node.linked) do
+				if not dist[other.id] and other ~= self.root and not other.ascendancyName then
+					dist[other.id] = dist[id] + 1
+					t_insert(queue, other)
+				end
+			end
+		end
+	end
+	self:Prune(trial)
+	if not self:ConnectMustHaves(trial) or trial.count > budget then
+		return nil
 	end
 	self:Fill(trial, budget, banned)
 	self:Fill(trial, budget)
@@ -2401,7 +2468,10 @@ function TreeOptimizer:Run()
 					perturbedFor, perturbFailures = self.best, 0
 				end
 				perturbFailures = perturbFailures + 1
-				trial = self:Perturb(self.best, self.points, m_min(2 + m_floor(perturbFailures / 4), 8))
+				if perturbFailures % 3 == 0 then
+					trial = self:PerturbRegion(self.best, self.points, 2 + m_floor(perturbFailures / 3) % 4)
+				end
+				trial = trial or self:Perturb(self.best, self.points, m_min(2 + m_floor(perturbFailures / 4), 8))
 			end
 			if trial and not self.stopped then
 				self.phase = "refine"
