@@ -86,6 +86,35 @@ describe("TreeOptimizer", function()
 		assert.are.equal(0, result.bestEval.deficit)
 	end)
 
+	it("re-ranks a mastery's effects only after the tree has changed enough", function()
+		local optimizer = TreeOptimizer.new(build, { powerStat = lifeStat, fromScratch = true })
+		local mastery
+		for _, node in pairs(build.spec.nodes) do
+			if node.type == "Mastery" and #optimizer:GetMasteryEffects(node) >= 4 and (not mastery or node.id < mastery.id) then
+				mastery = node
+			end
+		end
+		local state = TreeOptimizer.new(build, { powerStat = lifeStat, fromScratch = true }):NewState()
+		TreeOptimizer.new(build, { powerStat = lifeStat, fromScratch = true }):Fill(state, 10)
+		state.eval = nil
+		local evals = optimizer.evalCount
+		local first = optimizer:BestMasteryEffect(state, mastery)
+		assert.are.equal(#optimizer:AvailableEffects(state, mastery), optimizer.evalCount - evals)
+		-- One more node: only the best effects of the last ranking are evaluated again
+		local grown = optimizer:CopyState(state)
+		for id in pairs(optimizer:Frontier(state, 1)) do
+			if build.spec.nodes[id].type ~= "Mastery" then
+				optimizer:AddNode(grown, build.spec.nodes[id])
+				break
+			end
+		end
+		assert.are.equal(state.count + 1, grown.count)
+		evals = optimizer.evalCount
+		optimizer:BestMasteryEffect(grown, mastery)
+		assert.is_true(optimizer.evalCount - evals <= 2)
+		assert.is_truthy(first)
+	end)
+
 	it("keeps the minimum unreserved mana", function()
 		local minMana = math.floor(build.calcsTab.mainOutput.ManaUnreserved) + 30
 		local optimizer, result = run({ points = 20, fromScratch = true, requirements = { ManaUnreserved = minMana } })

@@ -11,7 +11,8 @@
 --   1. Seed: start from the current tree (or from the class start), drop must-not nodes and anything they cut off.
 --   2. Connect: add the cheapest path to every must-have node (greedy Steiner tree heuristic).
 --   3. Trim: while over budget, remove the branch that costs the least score per point.
---   4. Fill: lazy greedy - repeatedly add the path with the best score gain per point.
+--   4. Fill: lazy greedy - repeatedly add the path with the best score gain per point. Never-evaluated paths take the
+--      estimate of a node with the same kind of stats, and a mastery's effects are ranked once per kind of mastery.
 --   5. Refine: remove a branch, refill without it, keep the result if it scored better. When no branch helps, swap a
 --      travel node for a neighbour (Reroute), or take the path to a notable/keystone 5-12 points away and pay for it
 --      with the cheapest branches anywhere in the tree (FarSwap).
@@ -733,15 +734,91 @@ function TreeOptimizer:ConnectMustHaves(state)
 	return true
 end
 
+-- A mastery's effects are ranked with one calculation each. Which effect is best rarely changes while the tree grows or
+-- shifts by a few nodes, so until the tree has changed size by this fraction since the last full ranking, only the
+-- MASTERY_TOP_EFFECTS best effects of that ranking are evaluated again. Masteries of the same kind (e.g. every Life
+-- Mastery) offer the same effects, so they share a ranking.
+local MASTERY_RERANK_CHANGE = 0.2
+local MASTERY_TOP_EFFECTS = 2
+
+function TreeOptimizer:MasteryRankKey(node)
+	local keys = self:OwnTable("masteryRankKeys")
+	if not keys[node.id] then
+		local ids = { }
+		for _, effect in ipairs(self:GetMasteryEffects(node)) do
+			t_insert(ids, effect.effect)
+		end
+		keys[node.id] = t_concat(ids, ",")
+	end
+	return keys[node.id]
+end
+
+-- Whether this object scores trees with predictions: ModelRound's proxy inherits from an optimizer instead of from
+-- TreeOptimizer. Predictions cost microseconds, so the shortcuts that save full calculations would only make the search
+-- on the model worse.
+function TreeOptimizer:PredictsScores()
+	return getmetatable(self) ~= TreeOptimizer
+end
+
+-- A cache table that belongs to this object. The model search (ModelRound's proxy) inherits from the optimizer, and
+-- caches filled from predictions must not leak into the real search, or the other way round.
+function TreeOptimizer:OwnTable(name)
+	local tbl = rawget(self, name)
+	if not tbl then
+		tbl = { }
+		rawset(self, name, tbl)
+	end
+	return tbl
+end
+
 function TreeOptimizer:BestMasteryEffect(state, node)
+	local ranks = self:OwnTable("masteryRanks")
+	local available = self:AvailableEffects(state, node)
+	local list = available
+	local rankKey = self:MasteryRankKey(node)
+	local rank = not self:PredictsScores() and ranks[rankKey]
+	if rank and math.abs(state.count - rank.count) <= rank.count * MASTERY_RERANK_CHANGE then
+		local isAvailable = { }
+		for _, effectId in ipairs(available) do
+			isAvailable[effectId] = true
+		end
+		list = { }
+		for _, effectId in ipairs(rank.order) do
+			if isAvailable[effectId] then
+				t_insert(list, effectId)
+				if #list >= MASTERY_TOP_EFFECTS then
+					break
+				end
+			end
+		end
+		if not list[1] then
+			list = available
+		end
+	end
 	local bestEffect, bestEval
-	for _, effectId in ipairs(self:AvailableEffects(state, node)) do
+	local evals = { }
+	for _, effectId in ipairs(list) do
 		local trial = self:CopyState(state)
 		self:AddNode(trial, node, effectId)
 		local eval = self:Evaluate(trial)
+		evals[effectId] = eval
 		if not bestEval or self:IsBetter(eval, bestEval) then
 			bestEffect, bestEval = effectId, eval
 		end
+	end
+	if list == available and available[1] then
+		local order = copyTable(available, true)
+		t_sort(order, function(a, b)
+			local ea, eb = evals[a], evals[b]
+			if (ea.deficit == 0) ~= (eb.deficit == 0) then
+				return ea.deficit == 0
+			end
+			if ea.score ~= eb.score then
+				return ea.score > eb.score
+			end
+			return a < b
+		end)
+		ranks[rankKey] = { count = state.count, order = order }
 	end
 	return bestEffect, bestEval
 end
@@ -822,13 +899,40 @@ end
 
 -- Furthest the fill reaches when nothing nearer improves the tree
 local MAX_FILL_REACH = 10
+-- Furthest away a mastery is considered. Ranking a mastery's effects takes a calculation per effect, and the path to a
+-- mastery runs through a notable that is a candidate of its own; once that is taken, the mastery is next to the tree.
+local FILL_MASTERY_REACH = 1
+
+-- Nodes with the same kind of stats (e.g. the many "+10 to Strength" nodes, or "5%" and "6% increased maximum Life")
+-- are worth about the same, so a never-evaluated target takes the last measured gain per point of a target with its
+-- signature as its estimate. The estimate only orders evaluations: nothing is taken before it's evaluated.
+function TreeOptimizer:NodeSignature(node)
+	local signatures = self:OwnTable("nodeSignatures")
+	if not signatures[node.id] then
+		if node.type == "Mastery" then
+			signatures[node.id] = "mastery:" .. self:MasteryRankKey(node)
+		elseif node.isJewelSocket or self.conqueredBySocket[node.id] or not node.sd then
+			-- Sockets carry different jewels, and conquered nodes change with their socket
+			signatures[node.id] = "node:" .. node.id
+		else
+			signatures[node.id] = node.type .. ":" .. t_concat(node.sd, "\n"):gsub("[%d%.]+", "#")
+		end
+	end
+	return signatures[node.id]
+end
 
 -- Phase 4: lazy greedy fill
--- `estimates` persist between fills: [targetId] = { gain = score gain of the path when last evaluated, key = state key }
+-- `estimates` persist between fills: [targetId] = { gain = score gain of the path when last evaluated, key = state key }.
+-- Candidates are re-evaluated best estimate first, and the first one whose estimate is up to date for the current tree
+-- is taken. Targets never evaluated estimate from a target with the same signature, or else go first.
 
 function TreeOptimizer:Fill(state, budget, banned)
 	self.estimates = self.estimates or { }
 	local estimates = self.estimates
+	-- [signature] = gain per point of the last evaluated target with that signature
+	local signatureRates = self:OwnTable("signatureRates")
+	local masteryReach = self:PredictsScores() and math.huge or FILL_MASTERY_REACH
+	local useSignatures = not self:PredictsScores()
 	-- How far paths may reach. Widened when nothing within reach helps (e.g. the class start is surrounded by
 	-- nodes that don't affect the stat) so points aren't left unspent. Narrowed again after every accepted path:
 	-- a wide frontier brings in many never-evaluated nodes after each step, which costs far more than re-widening.
@@ -844,16 +948,18 @@ function TreeOptimizer:Fill(state, budget, banned)
 		local candidates = { }
 		for id, d in pairs(dist) do
 			local node = self.spec.nodes[id]
-			local est = estimates[id]
-			local priority = est and (est.gain / d) or math.huge
-			t_insert(candidates, { id = id, node = node, dist = d, priority = priority, fresh = est and est.key == baseKey })
+			if node.type ~= "Mastery" or d <= masteryReach then
+				local est = estimates[id]
+				t_insert(candidates, { id = id, node = node, dist = d, priority = est and (est.gain / d), signature = self:NodeSignature(node), fresh = est and est.key == baseKey })
+			end
 		end
 		local accepted
 		while candidates[1] and not self.stopped do
-			local best
+			local best, bestPriority
 			for _, cand in ipairs(candidates) do
-				if not best or cand.priority > best.priority then
-					best = cand
+				local priority = cand.priority or (useSignatures and signatureRates[cand.signature]) or math.huge
+				if not best or priority > bestPriority then
+					best, bestPriority = cand, priority
 				end
 			end
 			if best.fresh then
@@ -881,6 +987,7 @@ function TreeOptimizer:Fill(state, budget, banned)
 				gain = -1e3
 			end
 			estimates[best.id] = { gain = gain, key = baseKey, effectId = effectId }
+			signatureRates[best.signature] = gain / best.dist
 			best.priority = gain / best.dist
 			best.fresh = true
 			best.path = path
