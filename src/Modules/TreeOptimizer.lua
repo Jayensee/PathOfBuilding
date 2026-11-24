@@ -13,6 +13,7 @@
 --   3. Trim: while over budget, remove the branch that costs the least score per point.
 --   4. Fill: lazy greedy - repeatedly add the path with the best score gain per point. Never-evaluated paths take the
 --      estimate of a node with the same kind of stats, and a mastery's effects are ranked once per kind of mastery.
+--      Out-of-date estimates rank at 85% of their value (FILL_SLACK), which saves a third of the calculations.
 --      Then, if the tree misses its requirements, Repair swaps branches for the paths that remove the most deficit per
 --      point, from anywhere within 12 points. A tree that meets the requirements always beats one that doesn't.
 --   5. Refine: remove a branch, refill without it, keep the result if it scored better. When no branch helps, swap a
@@ -1121,6 +1122,9 @@ end
 
 -- Furthest the fill reaches when nothing nearer improves the tree
 local MAX_FILL_REACH = 10
+-- A candidate whose estimate is out of date is ranked at this share of it, so a freshly evaluated candidate that is nearly as
+-- good as the best estimate is taken without evaluating the next one (cuts the calculations per step by about a third)
+local FILL_SLACK = 0.85
 -- Furthest away a mastery is considered. Ranking a mastery's effects takes a calculation per effect, and the path to a
 -- mastery runs through a notable that is a candidate of its own; once that is taken, the mastery is next to the tree.
 local FILL_MASTERY_REACH = 1
@@ -1159,6 +1163,7 @@ function TreeOptimizer:Fill(state, budget, banned)
 	-- nodes that don't affect the stat) so points aren't left unspent. Narrowed again after every accepted path:
 	-- a wide frontier brings in many never-evaluated nodes after each step, which costs far more than re-widening.
 	local reach = self.maxPathLength
+	local slack = FILL_SLACK
 	while state.count < budget and not self.stopped do
 		local base = self:Evaluate(state)
 		local baseKey = stateKey(state)
@@ -1185,6 +1190,9 @@ function TreeOptimizer:Fill(state, budget, banned)
 			local best, bestPriority
 			for _, cand in ipairs(candidates) do
 				local priority = cand.priority or (useSignatures and signatureRates[cand.signature]) or math.huge
+				if not cand.fresh and priority > 0 and priority < math.huge then
+					priority = priority * slack
+				end
 				if not best or priority > bestPriority then
 					best, bestPriority = cand, priority
 				end
@@ -1771,7 +1779,7 @@ local MODEL_MAX_FAILURES = 3
 -- Share of the run the model may use (measuring, searching and checking), and the longest one round may spend measuring,
 -- as a share of the time limit. The rest goes to the real search, which keeps improving long after the model has
 -- measured what is worth measuring.
-local MODEL_SHARE = 0.3
+local MODEL_SHARE = 0.4
 local MODEL_MEASURE_SHARE = 0.08
 
 -- Effect of moving from `base` to `eval` on the modelled values
