@@ -919,7 +919,8 @@ function TreeOptimizer:BranchCuts(state)
 		if other then
 			top.i = top.i + 1
 			local id = other.id
-			if nodes[id] and other.type ~= "Mastery" then
+			-- The class start counts as a link to the tree: a node next to it stays connected when another path to it is cut
+			if (nodes[id] or id == rootId) and other.type ~= "Mastery" then
 				if not disc[id] then
 					count = count + 1
 					disc[id], low[id], parent[id], children[id] = count, count, node.id, { }

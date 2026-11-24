@@ -238,6 +238,55 @@ describe("TreeOptimizer", function()
 			end
 		end)
 
+		it("keeps nodes next to the class start connected when a loop closes through it", function()
+			local optimizer = TreeOptimizer.new(build, { powerStat = lifeStat, points = 30, fromScratch = true })
+			local root = optimizer.root
+			-- Shortest path between two nodes next to the class start that avoids the class start
+			local state, found = optimizer:NewState(), false
+			for _, first in ipairs(root.linked) do
+				for _, last in ipairs(root.linked) do
+					if not found and first.id < last.id and optimizer:IsEligible(first) and optimizer:IsEligible(last) then
+						local parent, queue, head = { [first.id] = false }, { first }, 1
+						while queue[head] and not parent[last.id] do
+							local node = queue[head]
+							head = head + 1
+							for _, other in ipairs(node.linked) do
+								if parent[other.id] == nil and other ~= root and other.type ~= "Mastery" and optimizer:IsEligible(other) then
+									parent[other.id] = node
+									table.insert(queue, other)
+								end
+							end
+						end
+						if parent[last.id] and optimizer:NewState() then
+							local node = last
+							while node do
+								optimizer:AddNode(state, node)
+								node = parent[node.id]
+							end
+							found = true
+						end
+					end
+				end
+			end
+			assert.is_true(found)
+			assert.is_truthy(optimizer:BranchCuts(state))
+			local function describe(branches)
+				local list = { }
+				for _, branch in ipairs(branches) do
+					local ids = copyTable(branch.ids)
+					table.sort(ids)
+					table.insert(list, branch.key .. "=" .. table.concat(ids, ","))
+				end
+				return table.concat(list, ";")
+			end
+			local fast = describe(optimizer:RemovableBranches(state, math.huge))
+			local leapNodes = optimizer.leapNodes
+			optimizer.leapNodes = { { id = -1, intuitiveLeapLikesAffecting = { } } }
+			local slow = describe(optimizer:RemovableBranches(state, math.huge))
+			optimizer.leapNodes = leapNodes
+			assert.are.equal(slow, fast)
+		end)
+
 		it("measures nodes with the same stats once, with exact predictions for each", function()
 			local optimizer, state = shortSightedTree(10)
 			optimizer.points = 10
