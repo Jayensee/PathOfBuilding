@@ -159,6 +159,17 @@ function TreeOptimizer.new(build, options)
 	self.anchorMinDist = options.anchorMinDist or 3
 	self.anchorMaxDist = options.anchorMaxDist or 10
 	self.anchorMaxAdded = options.anchorMaxAdded or 12
+	-- Off by default (it measured neutral): later anchors are chosen on the tree with the earlier paths added (one calculation per candidate: the best
+	-- anchorCondTop by prior value and anchorCondRandom others), by that gain per path point
+	self.anchorConditional = options.anchorConditional == true
+	self.anchorCondTop = options.anchorCondTop or 6
+	self.anchorCondRandom = options.anchorCondRandom or 2
+	-- A kick's refine slices shrink to fit the time it has (kickEnd); the run doesn't start one with less than
+	-- anchorMinKick of the limit left
+	self.anchorBudgetAware = options.anchorBudgetAware ~= false
+	self.anchorMinKick = options.anchorMinKick or 0.04
+	-- The prior value of a candidate is the gain of its whole path from the tree, not of the node alone
+	self.anchorPathValue = options.anchorPathValue == true
 	-- Adaptive schedule (see Run): after adaptiveStart of the run, a bandit hands out slices of adaptiveSlice of the time
 	-- limit to the search methods by the discounted gain per second each has produced in this run
 	self.adaptive = options.adaptiveSchedule ~= false
@@ -2861,7 +2872,7 @@ local ANCHOR_MEASURES = 16
 local ANCHOR_NEAR_DIST = 8
 
 -- Returns the refined tree (nil when nothing could be tried), and whether no anchor candidates are left on this tree
-function TreeOptimizer:AnchorKick(state, budget, lossOf)
+function TreeOptimizer:AnchorKick(state, budget, lossOf, kickEnd)
 	self.anchorValue = self.anchorValue or { }
 	self.anchorTried = self.anchorTried or { }
 	self.anchorKicks = self.anchorKicks or { }
@@ -2932,7 +2943,13 @@ function TreeOptimizer:AnchorKick(state, budget, lossOf)
 		unmeasured[i] = unmeasured[#unmeasured]
 		unmeasured[#unmeasured] = nil
 		local trial = self:CopyState(state)
-		self:AddNode(trial, cand.node)
+		if self.anchorPathValue then
+			for _, pathNode in ipairs(self:TargetPath(trial, cand.node, dist, parent)) do
+				self:AddNode(trial, pathNode)
+			end
+		else
+			self:AddNode(trial, cand.node)
+		end
 		values[cand.id] = self:Evaluate(trial).score - base.score
 		if values[cand.id] > EPSILON then
 			positive = positive + 1
@@ -2969,12 +2986,69 @@ function TreeOptimizer:AnchorKick(state, budget, lossOf)
 	local wanted = self.random(1, 3)
 	while #anchors < wanted and trial.count - state.count < self.anchorMaxAdded do
 		local more, d2, p2 = candidatesFrom(trial, 1, ANCHOR_NEAR_DIST)
-		local pick = weightedPick(more, function(cand)
-			if trial.nodes[cand.id] or not values[cand.id] or trial.count - state.count + cand.dist > self.anchorMaxAdded then
-				return 0
+		local function usable(cand)
+			return not trial.nodes[cand.id] and trial.count - state.count + cand.dist <= self.anchorMaxAdded
+		end
+		local pick
+		if self.anchorConditional then
+			-- The best candidates by prior value and a few others are measured on the tree as it is now
+			local pool = { }
+			for _, cand in ipairs(more) do
+				if usable(cand) then
+					t_insert(pool, cand)
+				end
 			end
-			return weightOf(cand)
-		end)
+			t_sort(pool, function(a, b)
+				local wa, wb = values[a.id] and weightOf(a) or 0, values[b.id] and weightOf(b) or 0
+				if wa ~= wb then
+					return wa > wb
+				end
+				return a.id < b.id
+			end)
+			local chosen = { }
+			for i = 1, m_min(self.anchorCondTop, #pool) do
+				t_insert(chosen, pool[i])
+			end
+			local rest = { }
+			for i = self.anchorCondTop + 1, #pool do
+				t_insert(rest, pool[i])
+			end
+			for _ = 1, self.anchorCondRandom do
+				if not rest[1] then
+					break
+				end
+				local i = self.random(1, #rest)
+				t_insert(chosen, rest[i])
+				rest[i] = rest[#rest]
+				rest[#rest] = nil
+			end
+			local trialScore = self:Evaluate(trial).score
+			local gains = { }
+			for _, cand in ipairs(chosen) do
+				if self.stopped then
+					return nil
+				end
+				local probe = self:CopyState(trial)
+				for _, pathNode in ipairs(self:TargetPath(probe, cand.node, d2, p2)) do
+					self:AddNode(probe, pathNode)
+				end
+				gains[cand.id] = self:Evaluate(probe).score - trialScore
+			end
+			pick = weightedPick(chosen, function(cand)
+				local g = gains[cand.id]
+				if not g or g <= EPSILON then
+					return 0
+				end
+				return g / cand.dist / (1 + (self.anchorFailures and self.anchorFailures[cand.id] or 0))
+			end)
+		else
+			pick = weightedPick(more, function(cand)
+				if not usable(cand) or not values[cand.id] then
+					return 0
+				end
+				return weightOf(cand)
+			end)
+		end
 		if not pick then
 			break
 		end
@@ -3031,6 +3105,10 @@ function TreeOptimizer:AnchorKick(state, budget, lossOf)
 	end
 	self:Fill(trial, budget)
 	local slice = self.timeLimit * self.anchorSlice
+	if self.anchorBudgetAware and kickEnd then
+		-- Two slices (locked, released) is all that is left to spend
+		slice = m_max(0, m_min(slice, (kickEnd - self:Now()) / 2))
+	end
 	-- Once stopped nothing more is calculated here: the caller tracks the tree it gets back
 	if not self.stopped then
 		record.trimmed = self:Evaluate(trial).score
@@ -3251,6 +3329,7 @@ function TreeOptimizer:Run()
 			eligible.model = self.useModel and modelRestingAt ~= bestKey
 			eligible.far = kicksOpen and farExhaustedFor ~= bestKey
 			eligible.anchor = kicksOpen and self.anchorShare > 0 and anchorExhaustedFor ~= bestKey
+				and (not self.anchorBudgetAware or deadline - self:Now() >= self.anchorMinKick * self.timeLimit)
 			eligible.perturb = kicksOpen
 			armName = self:PickArm(arms, eligible, sliceTime)
 			local sliceEnd = m_min(deadline, self:Now() + sliceTime)
@@ -3284,7 +3363,7 @@ function TreeOptimizer:Run()
 			elseif armName == "anchor" then
 				self.phase = "anchor"
 				local anchorStart = self:Now()
-				local trial, exhausted = self:AnchorKick(self.best, self.points, self:BranchLossFunction(bestLosses))
+				local trial, exhausted = self:AnchorKick(self.best, self.points, self:BranchLossFunction(bestLosses), kickEnd)
 				if trial then
 					self:Track(trial)
 					state = trial
@@ -3336,14 +3415,15 @@ function TreeOptimizer:Run()
 				end
 			end
 		elseif localOptima >= 1 and self.anchorShare > 0 and anchorExhaustedFor ~= bestKey
-			and anchorTime <= self.anchorShare * (self:Now() - startTime) then
+			and anchorTime <= self.anchorShare * (self:Now() - startTime)
+			and (not self.anchorBudgetAware or deadline - self:Now() >= self.anchorMinKick * self.timeLimit) then
 			armName = "anchor"
 			self.phase = "anchor"
 			local anchorStart = self:Now()
 			if bestLossesFor ~= self.best then
 				bestLosses, bestLossesFor = { }, self.best
 			end
-			local trial, exhausted = self:AnchorKick(self.best, self.points, self:BranchLossFunction(bestLosses))
+			local trial, exhausted = self:AnchorKick(self.best, self.points, self:BranchLossFunction(bestLosses), deadline)
 			if trial then
 				self:Track(trial)
 				state = trial
@@ -3374,7 +3454,7 @@ function TreeOptimizer:Run()
 			armName = "far"
 			if self.anchorPlateau > 0 and plateauKicks % self.anchorPlateau == 0 then
 				self.phase = "anchor"
-				trial = self:AnchorKick(self.best, self.points, self:BranchLossFunction(bestLosses))
+				trial = self:AnchorKick(self.best, self.points, self:BranchLossFunction(bestLosses), deadline)
 				anchored = trial ~= nil
 				armName = anchored and "anchor" or armName
 				self.phase = "far swap"

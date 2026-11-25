@@ -309,6 +309,31 @@ describe("TreeOptimizer", function()
 			assert.are.equal(kick(), kick())
 		end)
 
+		it("kicks with a cap on its time spend less, with conditional anchors on or off, and stay valid and deterministic", function()
+			local function kick(opts, capped)
+				local optimizer, state = shortSightedTree(40, "evals")
+				for k, v in pairs(opts) do optimizer[k] = v end
+				optimizer.timeLimit = 5
+				optimizer.maxEvals = 3000
+				optimizer.startTime = optimizer:Now()
+				local start = optimizer.evalCount
+				local after = optimizer:AnchorKick(state, 40, optimizer:BranchLossFunction({ }), capped and (optimizer:Now() + 0.1) or nil)
+				if after then
+					assert.is_true(after.count <= 40)
+					assertConnected(optimizer, after)
+				end
+				return optimizer.evalCount - start, after and optimizer:Evaluate(after).score
+			end
+			local freeEvals = kick({ anchorConditional = true }, false)
+			local cappedEvals = kick({ anchorConditional = true }, true)
+			assert.is_true(cappedEvals < freeEvals)
+			local a1, a2 = kick({ anchorConditional = true, anchorPathValue = false }, false)
+			assert.is_true(a1 > 0)
+			local b1, b2 = kick({ anchorConditional = true, anchorPathValue = false }, false)
+			assert.are.equal(a2, b2)
+			kick({ anchorConditional = false, anchorPathValue = true }, false)
+		end)
+
 		it("stops a kick at once: no calculations past the stop, tree connected and within budget, must-haves restored", function()
 			for _, limit in ipairs({ 17, 30, 45, 76 }) do
 				local optimizer, state = shortSightedTree(40, "evals")
