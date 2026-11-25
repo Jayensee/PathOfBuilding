@@ -2252,6 +2252,8 @@ function TreeOptimizer:ModelRound(deadline)
 			checked[candidate.key] = true
 			checks = checks + 1
 			local state = self:CopyState(candidate.state)
+			-- The model's own tree, for judging its entries: a repair swaps in nodes it knows nothing about
+			local modelTree = self:CopyState(state)
 			state.eval = nil
 			local eval = self:Evaluate(state)
 			self:Track(state)
@@ -2266,7 +2268,7 @@ function TreeOptimizer:ModelRound(deadline)
 			if self:IsBetter(eval, bestEval or baseEval) then
 				bestState, bestEval = state, eval
 			elseif not self:IsBetter(eval, baseEval) then
-				for _, key in ipairs(changedKeys(base, state)) do
+				for _, key in ipairs(changedKeys(base, modelTree)) do
 					local entry = model.with[key]
 					if entry and entry.version ~= model.version then
 						model.suspect[key] = true
@@ -2330,7 +2332,7 @@ function TreeOptimizer:PerturbRegion(state, budget, radius)
 		end
 		if dist[id] < radius then
 			for _, other in ipairs(node.linked) do
-				if not dist[other.id] and other ~= self.root and not other.ascendancyName then
+				if not dist[other.id] and other ~= self.root and not other.ascendancyName and other.type ~= "ClassStart" and other.type ~= "AscendClassStart" then
 					dist[other.id] = dist[id] + 1
 					t_insert(queue, other)
 				end
