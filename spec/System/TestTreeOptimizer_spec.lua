@@ -85,7 +85,7 @@ describe("TreeOptimizer", function()
 		end
 
 		it("discovers the fields a custom score function reads, and predicts through it", function()
-			local optimizer = run({ points = 12, fromScratch = true, scoreFunction = score, structuredModel = true, clock = "evals", timeLimit = 1.5, maxEvals = math.huge })
+			local optimizer = run({ points = 12, fromScratch = true, scoreFunction = score, structuredModel = true, adaptiveSchedule = false, clock = "evals", timeLimit = 1.5, maxEvals = math.huge })
 			assert.is_true(optimizer.structured)
 			assert.are.same({ "FireResist", "Life" }, optimizer.discPaths)
 			local model = optimizer.model
@@ -106,7 +106,7 @@ describe("TreeOptimizer", function()
 		end)
 
 		it("learns per field from its checks how far to trust the summed change, and clamps to what was observed", function()
-			local optimizer = run({ points = 12, fromScratch = true, scoreFunction = score, structuredModel = true, clock = "evals", timeLimit = 1.5, maxEvals = math.huge })
+			local optimizer = run({ points = 12, fromScratch = true, scoreFunction = score, structuredModel = true, adaptiveSchedule = false, clock = "evals", timeLimit = 1.5, maxEvals = math.huge })
 			assert.is_true(optimizer.fieldCalibration)
 			local model = optimizer.model
 			local path = "Life"
@@ -314,6 +314,26 @@ describe("TreeOptimizer", function()
 			local _, on = run({ anchorShare = 1, anchorPlateau = 1, anchorSlice = 0.05, clock = "evals", maxEvals = 300 })
 			assert.is_truthy(off.best)
 			assert.is_truthy(on.best)
+		end)
+
+		it("runs with the adaptive schedule: records every method's turns, deterministic, within budget", function()
+			local function adaptive()
+				local optimizer, result = run({ adaptiveSchedule = true, adaptiveStart = 0.1, adaptiveSlice = 0.1, clock = "evals", timeLimit = 6, maxEvals = 400, seed = 5 })
+				assert.is_true(result.evals <= 400)
+				assert.is_truthy(result.schedule.refine)
+				return optimizer:Evaluate(result.best).score, result.schedule
+			end
+			local scoreA, scheduleA = adaptive()
+			local scoreB, scheduleB = adaptive()
+			assert.are.equal(scoreA, scoreB)
+			for name, arm in pairs(scheduleA) do
+				assert.are.equal(arm.pulls, scheduleB[name].pulls)
+			end
+			-- The method with too little of the run's time is picked first, whatever the rates
+			local optimizer = TreeOptimizer.new(build, { powerStat = lifeStat, adaptiveMinShare = 0.05 })
+			local arms = { refine = { time = 10, gain = 5, recentTime = 10, recentGain = 5 } }
+			assert.are.equal("far", optimizer:PickArm(arms, { refine = true, far = true }, 1))
+			assert.are.equal("refine", optimizer:PickArm(arms, { refine = true }, 1))
 		end)
 
 		it("predicts single node changes exactly with the node value model", function()

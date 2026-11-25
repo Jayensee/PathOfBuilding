@@ -514,6 +514,7 @@ local function runOne(dir, file, mode, settings)
 		msPerEval = result.evals > 0 and stats.calcTime / result.evals * 1000 or 0,
 		modelRounds = result.modelRounds,
 		localOptima = result.localOptima,
+		schedule = result.schedule,
 		curve = curve,
 		accuracy = predictionStats(optimizer.predictionLog or { }),
 		structured = optimizer.structured,
@@ -544,6 +545,17 @@ local function printResult(r)
 	out("final (%.1fs): ratio=%.4f dlog=%+.4f deficit=%.3g nodes=%d %s\n", r.time, r.final.ratio, r.final.dlog, r.final.deficit, r.final.count, table.concat(r.final.violations, "; "))
 	out("evals=%d cacheHits=%d calc=%.1fs (%.1f%% of run) ms/eval=%.1f modelRounds=%d localOptima=%d\n", r.evals, r.cacheHits, r.calcTime,
 		100 * r.calcTime / math.max(r.runTime, 1e-9), r.msPerEval, r.modelRounds, r.localOptima)
+	if r.schedule then
+		local names = { }
+		for name in pairs(r.schedule) do names[#names + 1] = name end
+		table.sort(names)
+		out("schedule:")
+		for _, name in ipairs(names) do
+			local a = r.schedule[name]
+			out("  %s pulls=%d time=%.1fs (%.0f%%) gain=%.4f", name, a.pulls, a.time, 100 * a.time / math.max(r.time, 1e-9), a.gain)
+		end
+		out("\n")
+	end
 	out("curve:")
 	for _, c in ipairs(r.curve) do
 		out("  %ds=%s(%s)", c.at, c.ratio and string.format("%.4f", c.ratio) or "-", c.evalsAt or "-")

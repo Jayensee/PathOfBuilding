@@ -116,6 +116,7 @@ local EPSILON = 1e-9
 ---@field modelRamp boolean? Raise the model's share of the run and its measuring spells between a quarter and a half of the time limit (default true in current mode; false keeps them constant; from scratch they always are).
 ---@field distancePenalty boolean? Subtract from each model prediction the optimism the model's checks showed at that distance from its base (default true).
 ---@field logPredictions boolean? Record model predictions against the calculations that check them in self.predictionLog.
+---@field adaptiveSchedule boolean? After adaptiveStart (0.25) of the run, a bandit chooses which search method (Refine, FarSwap, model round, anchor kick, perturbation) gets the next slice (adaptiveSlice, 0.05 of the limit) by the discounted gain per second each has produced in this run, with an optional minimum share (adaptiveMinShare, default 0) and an exploration bonus (adaptiveExplore, 0.3); default true, false keeps the fixed schedule.
 ---@field maxEvals number? Hard cap on the number of calculations.
 ---@field onProgress fun(info: table)? Called after every calculation. Running inside a coroutine, it may yield.
 ---@field shouldStop fun(): boolean? Polled after every calculation; returning true ends the run with the best tree so far.
@@ -158,6 +159,16 @@ function TreeOptimizer.new(build, options)
 	self.anchorMinDist = options.anchorMinDist or 3
 	self.anchorMaxDist = options.anchorMaxDist or 10
 	self.anchorMaxAdded = options.anchorMaxAdded or 12
+	-- Adaptive schedule (see Run): after adaptiveStart of the run, a bandit hands out slices of adaptiveSlice of the time
+	-- limit to the search methods by the discounted gain per second each has produced in this run
+	self.adaptive = options.adaptiveSchedule ~= false
+	self.adaptiveStart = options.adaptiveStart or 0.25
+	self.adaptiveSlice = options.adaptiveSlice or 0.05
+	self.adaptiveKickCap = options.adaptiveKickCap or 3
+	self.adaptiveMinShare = options.adaptiveMinShare or 0
+	self.adaptiveExplore = options.adaptiveExplore or 0.3
+	self.adaptiveDecay = options.adaptiveDecay or 0.8
+	self.adaptiveKicksNeedOptimum = options.adaptiveKicksNeedOptimum == true
 	-- Keep the values the model needs from every calculation, so trees the search has calculated anyway (e.g. a
 	-- branch removed by Refine) serve as model measurements for free
 	self.captureFields = self.useModel
@@ -1465,11 +1476,15 @@ end
 -- Phase 5: refine by removing a branch and refilling without it. With `once`, returns after the first improving move
 -- (so the caller can take its turn on the better tree), otherwise at a local optimum.
 
-function TreeOptimizer:Refine(state, budget, deadline, once)
+function TreeOptimizer:Refine(state, budget, deadline, once, memo)
 	local tried = { }
 	-- Loss per point of removing each branch, from the last time it was evaluated. Removing a branch elsewhere
 	-- in the tree rarely changes another branch's value much, so stale losses are good enough for ordering.
 	local branchLoss = { }
+	-- A memo lets a later call on the same tree carry on where this one stopped (the adaptive schedule refines in slices)
+	if memo and memo.key == stateKey(state) then
+		tried, branchLoss = memo.tried, memo.loss
+	end
 	local function removeBranch(branch)
 		local trial = self:CopyState(state)
 		for _, id in ipairs(branch.ids) do
@@ -1531,6 +1546,9 @@ function TreeOptimizer:Refine(state, budget, deadline, once)
 				improved = true
 			end
 		end
+	end
+	if memo then
+		memo.key, memo.tried, memo.loss = stateKey(state), tried, branchLoss
 	end
 	return state
 end
@@ -3033,6 +3051,46 @@ function TreeOptimizer:AnchorKick(state, budget, lossOf)
 end
 
 -- Main entry point. Returns a result table; call :ApplyToNewSpec(result) to add it to the build.
+-- Adaptive schedule: picks the method (a key of `eligible`) that gets the next slice. Each method's value is the gain of
+-- the best tree's merit per second of its recent turns (discounted per turn), plus an upper-confidence bonus that is
+-- large for a method that has had little time. A method below its minimum share of the run's time goes first.
+function TreeOptimizer:PickArm(arms, eligible, sliceTime)
+	local names = { "refine", "model", "far", "anchor", "perturb" }
+	local total, totalRecent, maxRate = 0, 0, 0
+	for _, name in ipairs(names) do
+		local arm = arms[name]
+		if arm then
+			total = total + arm.time
+			totalRecent = totalRecent + arm.recentTime
+		end
+	end
+	local rates = { }
+	for _, name in ipairs(names) do
+		local arm = arms[name]
+		rates[name] = arm and arm.recentGain / (arm.recentTime + sliceTime * 0.5) or 0
+		if eligible[name] then
+			maxRate = m_max(maxRate, rates[name])
+		end
+	end
+	local pick, pickIndex, starved, starvedShare
+	for _, name in ipairs(names) do
+		if eligible[name] then
+			local arm = arms[name]
+			local time = arm and arm.time or 0
+			local share = time / m_max(total + sliceTime, 1e-9)
+			if share < self.adaptiveMinShare and (not starved or share < starvedShare) then
+				starved, starvedShare = name, share
+			end
+			local n = (arm and arm.recentTime or 0) / sliceTime
+			local index = rates[name] + self.adaptiveExplore * maxRate * math.sqrt(m_log(totalRecent / sliceTime + 2) / (n + 0.5))
+			if not pick or index > pickIndex + 1e-15 then
+				pick, pickIndex = name, index
+			end
+		end
+	end
+	return starved or pick or "refine"
+end
+
 function TreeOptimizer:Run()
 	local startTime = self:Now()
 	self.startTime = startTime
@@ -3136,11 +3194,33 @@ function TreeOptimizer:Run()
 	local modelTime = 0
 	local anchorTime, anchorExhaustedFor = 0, nil
 	local plateauKicks = 0
+	local farExhaustedFor
+	local refineMemo = { }
+	-- Every method's turns are recorded (also under the fixed schedule): the gain of the best tree's merit and the time
+	-- the turn took, discounted per turn of that method so the rates follow the run (see PickArm)
+	local arms = { }
+	local function bestValue()
+		return self.best and self:Merit(self.best.eval) or 0
+	end
+	local function credit(name, value0, time0)
+		local arm = arms[name]
+		if not arm then
+			arm = { pulls = 0, time = 0, gain = 0, recentTime = 0, recentGain = 0 }
+			arms[name] = arm
+		end
+		local dt = m_max(self:Now() - time0, 1e-9)
+		local gain = m_max(0, bestValue() - value0)
+		arm.pulls, arm.time, arm.gain = arm.pulls + 1, arm.time + dt, arm.gain + gain
+		arm.recentTime = arm.recentTime * self.adaptiveDecay + dt
+		arm.recentGain = arm.recentGain * self.adaptiveDecay + gain
+	end
+	local sliceTime = self.timeLimit * self.adaptiveSlice
 	-- From scratch, the fill's tree is refined before the model measures anything: the model's measuring is a large
 	-- fixed cost that only pays off on a tree that is already decent
 	local scratchRefined = not self.fromScratch
 	while not self.stopped and self:Now() < deadline do
 		local bestKey = stateKey(self.best)
+		local armName, armValue, armTime = nil, bestValue(), self:Now()
 		if self.best.eval.deficit > 0 and repaired ~= self.best then
 			-- A best tree that misses its requirements gets one repair before anything else is tried on it
 			self.phase = "repair"
@@ -3155,7 +3235,84 @@ function TreeOptimizer:Run()
 			local trial = self:Refine(self:CopyState(self.best), self.points, refineDeadline)
 			self:Track(trial)
 			state = trial
+		elseif self.adaptive and self:Now() - startTime >= self.adaptiveStart * self.timeLimit then
+			-- Adaptive schedule: the bandit picks the method for the next slice; a kick's slice ends after its follow-up
+			local kicksOpen = localOptima >= 1 or not self.adaptiveKicksNeedOptimum
+			local eligible = { refine = refinedKey ~= bestKey }
+			eligible.model = self.useModel and modelRestingAt ~= bestKey
+			eligible.far = kicksOpen and farExhaustedFor ~= bestKey
+			eligible.anchor = kicksOpen and self.anchorShare > 0 and anchorExhaustedFor ~= bestKey
+			eligible.perturb = kicksOpen
+			armName = self:PickArm(arms, eligible, sliceTime)
+			local sliceEnd = m_min(deadline, self:Now() + sliceTime)
+			local kickEnd = m_min(deadline, self:Now() + sliceTime * self.adaptiveKickCap)
+			if bestLossesFor ~= self.best then
+				bestLosses, bestLossesFor = { }, self.best
+			end
+			if armName == "refine" then
+				self.phase = "refine"
+				local trial = self:Refine(self:CopyState(self.best), self.points, sliceEnd, false, refineMemo)
+				self:Track(trial)
+				state = trial
+				if stateKey(self.best) == bestKey and not self.stopped and self:Now() < sliceEnd then
+					refinedKey = bestKey
+					localOptima = localOptima + 1
+				end
+			elseif armName == "model" then
+				modelRounds = modelRounds + 1
+				local roundStart = self:Now()
+				local found, pending = self:ModelRound(deadline)
+				modelTime = modelTime + self:Now() - roundStart
+				if found then
+					modelFailures = 0
+				else
+					modelFailures = modelFailures + 1
+					if not pending or modelFailures >= MODEL_MAX_FAILURES then
+						modelRestingAt = stateKey(self.best)
+						modelFailures = 0
+					end
+				end
+			elseif armName == "anchor" then
+				self.phase = "anchor"
+				local anchorStart = self:Now()
+				local trial, exhausted = self:AnchorKick(self.best, self.points, self:BranchLossFunction(bestLosses))
+				if trial then
+					self:Track(trial)
+					state = trial
+					localOptima = localOptima + 1
+				elseif exhausted or not self.stopped then
+					anchorExhaustedFor = bestKey
+				end
+				anchorTime = anchorTime + self:Now() - anchorStart
+			else
+				local trial
+				if armName == "far" then
+					self.phase = "far swap"
+					trial = self:FarSwap(self.best, self.points, self:BranchLossFunction(bestLosses))
+					if not trial and not self.stopped then
+						farExhaustedFor = bestKey
+					end
+				else
+					self.phase = "perturb"
+					if perturbedFor ~= self.best then
+						perturbedFor, perturbFailures = self.best, 0
+					end
+					perturbFailures = perturbFailures + 1
+					if perturbFailures % 3 == 0 then
+						trial = self:PerturbRegion(self.best, self.points, 2 + m_floor(perturbFailures / 3) % 4)
+					end
+					trial = trial or self:Perturb(self.best, self.points, m_min(2 + m_floor(perturbFailures / 4), 8))
+				end
+				if trial and not self.stopped then
+					self.phase = "refine"
+					trial = self:Refine(trial, self.points, kickEnd)
+					self:Track(trial)
+					state = trial
+					localOptima = localOptima + 1
+				end
+			end
 		elseif self.useModel and modelRestingAt ~= bestKey and modelTime <= self:ModelShares(false) * (self:Now() - startTime) then
+			armName = "model"
 			modelRounds = modelRounds + 1
 			local roundStart = self:Now()
 			local found, pending = self:ModelRound(deadline)
@@ -3171,6 +3328,7 @@ function TreeOptimizer:Run()
 			end
 		elseif localOptima >= 1 and self.anchorShare > 0 and anchorExhaustedFor ~= bestKey
 			and anchorTime <= self.anchorShare * (self:Now() - startTime) then
+			armName = "anchor"
 			self.phase = "anchor"
 			local anchorStart = self:Now()
 			if bestLossesFor ~= self.best then
@@ -3185,6 +3343,7 @@ function TreeOptimizer:Run()
 			end
 			anchorTime = anchorTime + self:Now() - anchorStart
 		elseif refinedKey ~= bestKey then
+			armName = "refine"
 			self.phase = "refine"
 			local trial = self:Refine(self:CopyState(self.best), self.points, deadline, true)
 			self:Track(trial)
@@ -3203,10 +3362,12 @@ function TreeOptimizer:Run()
 			self.phase = "far swap"
 			plateauKicks = plateauKicks + 1
 			local trial, anchored
+			armName = "far"
 			if self.anchorPlateau > 0 and plateauKicks % self.anchorPlateau == 0 then
 				self.phase = "anchor"
 				trial = self:AnchorKick(self.best, self.points, self:BranchLossFunction(bestLosses))
 				anchored = trial ~= nil
+				armName = anchored and "anchor" or armName
 				self.phase = "far swap"
 			end
 			if not trial and not self.stopped then
@@ -3218,6 +3379,7 @@ function TreeOptimizer:Run()
 				localOptima = localOptima + 1
 				trial = nil
 			elseif not trial and not self.stopped then
+				armName = "perturb"
 				self.phase = "perturb"
 				-- Kicks that keep failing to lead anywhere better grow, so a deep local optimum is eventually left
 				if perturbedFor ~= self.best then
@@ -3237,7 +3399,11 @@ function TreeOptimizer:Run()
 				localOptima = localOptima + 1
 			end
 		end
+		if armName then
+			credit(armName, armValue, armTime)
+		end
 	end
+	self.arms = arms
 
 	local best = self.best or state
 	return {
@@ -3256,6 +3422,7 @@ function TreeOptimizer:Run()
 		thoroughEvals = thoroughEvals,
 		thoroughTime = thoroughTime,
 		time = self:Now() - startTime,
+		schedule = arms,
 		stopped = self.stopped and not self.timeUp,
 	}
 end
