@@ -131,12 +131,6 @@ end
 function calcs.getMiscCalculator(build)
 	-- Run base calculation pass
 	local env, cachedPlayerDB, cachedEnemyDB, cachedMinionDB = calcs.initEnv(build, "CALCULATOR")
-	-- Flat copy of the base mods, which every environment built by the closure below starts from (see calcs.initEnv)
-	local baseSnapshot = {
-		build = build,
-		player = calcs.copyDBInto(new("ModDB"):ModDB(), cachedPlayerDB),
-		enemy = calcs.copyDBInto(new("ModDB"):ModDB(), cachedEnemyDB),
-	}
 	calcs.perform(env)
 	local fullDPS = calcs.calcFullDPS(build, "CALCULATOR", {}, { cachedPlayerDB = cachedPlayerDB, cachedEnemyDB = cachedEnemyDB, cachedMinionDB = cachedMinionDB, env = nil})
 	local usedFullDPS = #fullDPS.skills > 0
@@ -147,7 +141,7 @@ function calcs.getMiscCalculator(build)
 	end
 	-- Always set, even without Full DPS skills, so sorting by Power Metric doesn't give every item 0
 	env.player.output.PowerMetric = powerMetricCalc(env)
-	local function calcFunc(override, useFullDPS)
+	return function(override, useFullDPS)
 		local env, cachedPlayerDB, cachedEnemyDB, cachedMinionDB = calcs.initEnv(build, "CALCULATOR", override)
 		-- Trigger-source calculations shared by this override's main and Full DPS passes
 		env.triggerSourceCache = { }
@@ -168,16 +162,6 @@ function calcs.getMiscCalculator(build)
 		end
 		env.player.output.PowerMetric = powerMetricCalc(env)
 		return env.player.output
-	end
-	return function(override, useFullDPS)
-		local prevSnapshot = calcs.miscBaseSnapshot
-		calcs.miscBaseSnapshot = baseSnapshot
-		local ok, result = pcall(calcFunc, override, useFullDPS)
-		calcs.miscBaseSnapshot = prevSnapshot
-		if not ok then
-			error(result, 0)
-		end
-		return result
 	end, env.player.output
 end
 
