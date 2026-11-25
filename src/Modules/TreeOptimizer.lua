@@ -14,6 +14,11 @@
 --   4. Fill: lazy greedy - repeatedly add the path with the best score gain per point. Never-evaluated paths take the
 --      estimate of a node with the same kind of stats, and a mastery's effects are ranked once per kind of mastery.
 --      Out-of-date estimates rank at 85% of their value (FILL_SLACK), which saves a third of the calculations.
+--      From scratch, a quick fill comes first: it leaves plain travel nodes out of the targets it measures (they are
+--      still part of the paths to notables and masteries), which takes a third to a half of the calculations, so a full
+--      valid tree exists after a few seconds. A thorough fill from the same start follows, measuring everything again
+--      (the quick one's estimates are dropped: they undervalue what it skipped), provided the quick one was cheap enough
+--      for the thorough one to fit in half the time limit; the better of the two trees is what the search continues with.
 --      Then, if the tree misses its requirements, Repair swaps branches for the paths that remove the most deficit per
 --      point, from anywhere within 12 points. A tree that meets the requirements always beats one that doesn't.
 --   5. Refine: remove a branch, refill without it, keep the result if it scored better. When no branch helps, swap a
@@ -1128,6 +1133,13 @@ local FILL_SLACK = 0.85
 -- Furthest away a mastery is considered. Ranking a mastery's effects takes a calculation per effect, and the path to a
 -- mastery runs through a notable that is a candidate of its own; once that is taken, the mastery is next to the tree.
 local FILL_MASTERY_REACH = 1
+-- During the first fill, how far away a plain travel node is evaluated as a target (0: not at all until the reach widens).
+-- Most of the first fill's calculations go to measuring every node in reach, and the notables, masteries and keystones are
+-- what pays; the travel nodes on the way are measured as part of the paths to them. This cuts the first fill by 30-40%
+-- and leaves it better placed against the deadline; applying it to the later fills too made the trees worse.
+local FILL_NORMAL_REACH = 0
+-- Share of the time limit within which the thorough fill that follows a quick one has to finish (see Run)
+local THOROUGH_FILL_SHARE = 0.5
 
 -- Nodes with the same kind of stats (e.g. the many "+10 to Strength" nodes, or "5%" and "6% increased maximum Life")
 -- are worth about the same, so a never-evaluated target takes the last measured gain per point of a target with its
@@ -1159,6 +1171,7 @@ function TreeOptimizer:Fill(state, budget, banned)
 	local signatureRates = self:OwnTable("signatureRates")
 	local masteryReach = self:PredictsScores() and math.huge or FILL_MASTERY_REACH
 	local useSignatures = not self:PredictsScores()
+	local normalReach = not self:PredictsScores() and self.fillNormalReach or nil
 	-- How far paths may reach. Widened when nothing within reach helps (e.g. the class start is surrounded by
 	-- nodes that don't affect the stat) so points aren't left unspent. Narrowed again after every accepted path:
 	-- a wide frontier brings in many never-evaluated nodes after each step, which costs far more than re-widening.
@@ -1175,7 +1188,11 @@ function TreeOptimizer:Fill(state, budget, banned)
 		local candidates = { }
 		for id, d in pairs(dist) do
 			local node = self.spec.nodes[id]
-			if node.type ~= "Mastery" or d <= masteryReach then
+			-- Plain travel nodes are mostly worth taking as part of the path to something else, so the first fill
+			-- doesn't evaluate them as targets of their own until the reach widens (see FILL_NORMAL_REACH)
+			local skipNormal = normalReach and node.type == "Normal" and d > normalReach and reach <= self.maxPathLength
+				and not estimates[id] and not (useSignatures and signatureRates[self:NodeSignature(node)])
+			if (node.type ~= "Mastery" or d <= masteryReach) and not skipNormal then
 				local path
 				if self.conqueredBySocket[id] then
 					path = self:TargetPath(state, node, dist, parent)
@@ -2389,7 +2406,13 @@ function TreeOptimizer:Run()
 
 	-- Phase 4: fill
 	self.phase = "fill"
+	-- From scratch, a quick fill that measures only the targets that matter comes first, so there is a full tree early;
+	-- the thorough fill that follows (see below) finds the tree the search then works on
+	local quick = self.fromScratch
+	local seedState = quick and self:CopyState(state)
+	self.fillNormalReach = quick and FILL_NORMAL_REACH or nil
 	self:Fill(state, self.points)
+	self.fillNormalReach = nil
 	self:Track(state)
 	-- Phase 4b: repair a tree that misses its requirements
 	local repaired
@@ -2399,10 +2422,35 @@ function TreeOptimizer:Run()
 		self:Track(state)
 		repaired = self.best
 	end
-	local afterFill = self:CopyState(state)
-	self.startState = afterFill
 	local fillTime = now() - startTime
 	local fillEvals = self.evalCount
+
+	-- Phase 4c: the thorough fill, from the same start. It is kept to a share of the time limit, and only started when the
+	-- quick one was cheap enough for it to fit; one that doesn't finish is dropped, and the best tree so far carries on.
+	local thoroughTime, thoroughEvals
+	if quick and not self.stopped and fillTime * 2 <= self.timeLimit * THOROUGH_FILL_SHARE then
+		self.phase = "fill"
+		self.deadline = startTime + self.timeLimit * THOROUGH_FILL_SHARE
+		-- Starts from scratch: what the quick fill measured on a tiny tree undervalues what it skipped, and a node whose
+		-- measurement came out low is never looked at again
+		self.estimates = nil
+		self.signatureRates, self.masteryRanks = nil, nil
+		local trial = self:Fill(seedState, self.points)
+		if self:Evaluate(trial).deficit > 0 and not self.stopped then
+			self.phase = "repair"
+			trial = self:Repair(trial, self.points)
+		end
+		self:Track(trial)
+		if self.timeUp and not (self.shouldStop and self.shouldStop()) and self.evalCount < self.maxEvals then
+			-- Only the share ran out, not the run
+			self.stopped, self.timeUp = false, false
+		end
+		self.deadline = nil
+		thoroughTime, thoroughEvals = now() - startTime, self.evalCount
+		repaired = nil
+	end
+	local afterFill = self:CopyState(quick and self.best or state)
+	self.startState = afterFill
 
 	-- The time limit covers the whole run; the fill always completes so there is a full tree to return
 	local deadline = startTime + self.timeLimit
@@ -2507,6 +2555,8 @@ function TreeOptimizer:Run()
 		cacheHits = self.cacheHits,
 		fillEvals = fillEvals,
 		fillTime = fillTime,
+		thoroughEvals = thoroughEvals,
+		thoroughTime = thoroughTime,
 		time = now() - startTime,
 		stopped = self.stopped and not self.timeUp,
 	}

@@ -363,6 +363,8 @@ local function runOne(dir, file, mode, settings)
 		final = { ratio = finalEval.value / init.value, dlog = finalEval.score - init.score, deficit = finalEval.deficit, value = finalEval.value, count = result.best.count, violations = violations },
 		fillTime = result.fillTime,
 		fillEvals = result.fillEvals,
+		thoroughTime = result.thoroughTime,
+		thoroughEvals = result.thoroughEvals,
 		time = result.time,
 		runTime = runTime,
 		evals = result.evals,
@@ -392,7 +394,7 @@ local function printResult(r)
 	end
 	out("\n### %s [%s]  points=%d mustHave=%d\n", r.build, r.mode, r.points, r.mustHave)
 	out("hand-made: value=%.6g score=%.5f deficit=%.3g %s\n", r.initial.value, r.initial.score, r.initial.deficit, table.concat(r.initial.violations or { }, "; "))
-	out("after fill (%.1fs, %d evals): ratio=%.4f dlog=%+.4f deficit=%.3g\n", r.fillTime, r.fillEvals, r.afterFill.ratio, r.afterFill.dlog, r.afterFill.deficit)
+	out("after fill (%.1fs, %d evals%s): ratio=%.4f dlog=%+.4f deficit=%.3g\n", r.fillTime, r.fillEvals, r.thoroughTime and string.format("; thorough fill done at %.1fs, %d evals", r.thoroughTime, r.thoroughEvals) or "", r.afterFill.ratio, r.afterFill.dlog, r.afterFill.deficit)
 	out("final (%.1fs): ratio=%.4f dlog=%+.4f deficit=%.3g nodes=%d %s\n", r.time, r.final.ratio, r.final.dlog, r.final.deficit, r.final.count, table.concat(r.final.violations, "; "))
 	out("evals=%d cacheHits=%d calc=%.1fs (%.1f%% of run) ms/eval=%.1f modelRounds=%d localOptima=%d\n", r.evals, r.cacheHits, r.calcTime,
 		100 * r.calcTime / math.max(r.runTime, 1e-9), r.msPerEval, r.modelRounds, r.localOptima)
