@@ -37,8 +37,8 @@ function math.average(t)
 	return (sum / count)
 end
 
-local function powerMetricCalc(env)
-	local output = env.player.output
+-- The Power Metric as a function of an output table alone (the tree optimizer evaluates it on predicted outputs)
+function calcs.powerMetricFromOutput(output)
 	-- Hit-based EHP isn't calculated in some configs (e.g. enemy damage type "Damage over Time")
 	if not output.TotalEHP or not output.EffectiveMaximumHitTaken then
 		return nil
@@ -74,6 +74,10 @@ local function powerMetricCalc(env)
 	end
 	local utility_metric = (aoe_mod * (speed^4 or 1)) ^ (1/5)
 	return tank_metric * damage_metric * utility_metric  / 1000
+end
+
+local function powerMetricCalc(env)
+	return calcs.powerMetricFromOutput(env.player.output)
 end
 
 -- Print various tables to the console
