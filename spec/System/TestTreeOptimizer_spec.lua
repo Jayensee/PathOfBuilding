@@ -292,6 +292,30 @@ describe("TreeOptimizer", function()
 			assert.is_true(gotFarNode)
 		end)
 
+		it("kicks with far anchors: connected, within budget, must-haves restored, deterministic", function()
+			local function kick()
+				local optimizer, state = shortSightedTree(40)
+				optimizer.timeLimit = 5
+				optimizer.maxEvals = 800
+				local mustBefore = copyTable(optimizer.mustHave, true)
+				local after = optimizer:AnchorKick(state, 40, optimizer:BranchLossFunction({ }))
+				assert.is_truthy(after)
+				assert.is_true(after.count <= 40)
+				assertConnected(optimizer, after)
+				assert.are.same(mustBefore, optimizer.mustHave)
+				assert.is_truthy(optimizer.anchorKicks[1])
+				return optimizer:Evaluate(after).score
+			end
+			assert.are.equal(kick(), kick())
+		end)
+
+		it("runs with the anchor kicks switched off or at every plateau", function()
+			local _, off = run({ anchorShare = 0, anchorPlateau = 0, clock = "evals", maxEvals = 300 })
+			local _, on = run({ anchorShare = 1, anchorPlateau = 1, anchorSlice = 0.05, clock = "evals", maxEvals = 300 })
+			assert.is_truthy(off.best)
+			assert.is_truthy(on.best)
+		end)
+
 		it("predicts single node changes exactly with the node value model", function()
 			local optimizer, state = shortSightedTree(10)
 			optimizer.points = 10

@@ -51,6 +51,11 @@
 --        random perturbation, each followed by Refine. Perturbation alternates between removing a few branches (more
 --        of them the more kicks fail) and removing a whole region around a notable (PerturbRegion). The search on the
 --        model uses the same kicks.
+--      - Far-anchor kicks (AnchorKick): after the first local optimum they take up to a share of the run (anchorShare 0.3) in
+--        place of Refine, and every anchorPlateau-th (2) kick at a plateau is one. 1-3 notables/keystones anchorMinDist..
+--        anchorMaxDist (3..10) links away, picked by the gain of each on its own per link, are connected and locked, the
+--        tree is cut back to the budget, refined for anchorSlice (0.12 of the limit) of locked and again of released time;
+--        the result counts only if it beats the best tree.
 --
 local m_max = math.max
 local m_min = math.min
@@ -144,6 +149,15 @@ function TreeOptimizer.new(build, options)
 	self.modelRamp = options.modelRamp
 	self.modelShare = options.modelShare
 	self.modelMeasureShare = options.modelMeasureShare
+	-- Far-anchor kicks (see AnchorKick): the share of the run, after the first local optimum, they may take instead of
+	-- Refine; how much of the time limit each of their two refining slices gets; and which of the kicks at a plateau is
+	-- one (every n-th, 0: none)
+	self.anchorShare = options.anchorShare or 0.3
+	self.anchorSlice = options.anchorSlice or 0.12
+	self.anchorPlateau = options.anchorPlateau or 2
+	self.anchorMinDist = options.anchorMinDist or 3
+	self.anchorMaxDist = options.anchorMaxDist or 10
+	self.anchorMaxAdded = options.anchorMaxAdded or 12
 	-- Keep the values the model needs from every calculation, so trees the search has calculated anyway (e.g. a
 	-- branch removed by Refine) serve as model measurements for free
 	self.captureFields = self.useModel
@@ -2813,6 +2827,211 @@ function TreeOptimizer:PerturbRegion(state, budget, radius)
 	return trial
 end
 
+-- Far-anchor kick
+--
+-- Notables that only pay together (their value comes from what they share, or from sitting on one path) are out of reach
+-- of single-node moves and of FarSwap, which takes one far target at a time and never gives the tree a chance to adapt to
+-- it. This kick picks 1-3 notables/keystones that are anchorMinDist to anchorMaxDist links away, weighted by the
+-- gain per link of adding each on its own (measured once and kept), later ones near the path of the first so the cost of
+-- getting there is shared. It connects them, makes their paths must-haves, cuts the tree back to the budget with the
+-- cheapest branches, refines for a slice of the run with the paths locked so the rest of the tree adapts to them, then
+-- releases them and refines for another slice. The caller keeps the result only if it beats the best tree.
+-- Most points the paths to the anchors may add
+-- Single-node measurements one kick may make
+local ANCHOR_MEASURES = 16
+-- Later anchors lie within this many links of the tree with the earlier ones connected
+local ANCHOR_NEAR_DIST = 8
+
+-- Returns the refined tree (nil when nothing could be tried), and whether no anchor candidates are left on this tree
+function TreeOptimizer:AnchorKick(state, budget, lossOf)
+	self.anchorValue = self.anchorValue or { }
+	self.anchorTried = self.anchorTried or { }
+	self.anchorKicks = self.anchorKicks or { }
+	local baseKey = stateKey(state)
+	local base = self:Evaluate(state)
+	local values = self.anchorValue
+	local function isAnchorType(node)
+		return node.type == "Notable" or node.type == "Keystone"
+	end
+	local function candidatesFrom(from, minDist, maxDist)
+		local dist, parent = self:Frontier(from, maxDist)
+		local list = { }
+		for id, d in pairs(dist) do
+			local node = self.spec.nodes[id]
+			if d >= minDist and isAnchorType(node) and not self.mustNot[id] then
+				t_insert(list, { id = id, node = node, dist = d })
+			end
+		end
+		t_sort(list, function(a, b) return a.id < b.id end)
+		return list, dist, parent
+	end
+	local function weightedPick(list, weightOf)
+		local total = 0
+		local weights = { }
+		for i, cand in ipairs(list) do
+			weights[i] = weightOf(cand)
+			total = total + weights[i]
+		end
+		if total <= 0 then
+			return nil
+		end
+		local r = self.random(1, 1000000) / 1000000 * total
+		for i, cand in ipairs(list) do
+			r = r - weights[i]
+			if r <= 0 and weights[i] > 0 then
+				return cand
+			end
+		end
+		for i = #list, 1, -1 do
+			if weights[i] > 0 then
+				return list[i]
+			end
+		end
+	end
+
+	local list, dist, parent = candidatesFrom(state, self.anchorMinDist, self.anchorMaxDist)
+	-- Measure a sample of the candidates not measured yet: the gain of the node on its own, on top of this tree
+	local unmeasured = { }
+	for _, cand in ipairs(list) do
+		if not values[cand.id] then
+			t_insert(unmeasured, cand)
+		end
+	end
+	local measured, positive = 0, 0
+	for _, cand in ipairs(list) do
+		if (values[cand.id] or 0) > EPSILON then
+			positive = positive + 1
+		end
+	end
+	-- At least ANCHOR_MEASURES, and on until one candidate is known to be worth something (up to three times as many)
+	while unmeasured[1] and (measured < ANCHOR_MEASURES or (positive == 0 and measured < ANCHOR_MEASURES * 3)) do
+		if self.stopped then
+			return nil
+		end
+		measured = measured + 1
+		local i = self.random(1, #unmeasured)
+		local cand = unmeasured[i]
+		unmeasured[i] = unmeasured[#unmeasured]
+		unmeasured[#unmeasured] = nil
+		local trial = self:CopyState(state)
+		self:AddNode(trial, cand.node)
+		values[cand.id] = self:Evaluate(trial).score - base.score
+		if values[cand.id] > EPSILON then
+			positive = positive + 1
+		end
+	end
+	local function weightOf(cand)
+		local v = values[cand.id]
+		if not v or v <= EPSILON then
+			return 0
+		end
+		return v / cand.dist / (1 + (self.anchorFailures and self.anchorFailures[cand.id] or 0))
+	end
+	local first = weightedPick(list, function(cand)
+		if self.anchorTried[baseKey .. ">" .. cand.id] then
+			return 0
+		end
+		return weightOf(cand)
+	end)
+	if not first then
+		return nil, not unmeasured[1]
+	end
+
+	-- Connect the anchors: the first, then up to two more near the tree with the earlier paths in it
+	local trial = self:CopyState(state)
+	local anchors, locked = { first.node }, { }
+	local function connect(cand, d, p)
+		local path = self:TargetPath(trial, cand.node, d, p)
+		for j = #path, 1, -1 do
+			self:AddNode(trial, path[j])
+			locked[path[j].id] = true
+		end
+	end
+	connect(first, dist, parent)
+	local wanted = self.random(1, 3)
+	while #anchors < wanted and trial.count - state.count < self.anchorMaxAdded do
+		local more, d2, p2 = candidatesFrom(trial, 1, ANCHOR_NEAR_DIST)
+		local pick = weightedPick(more, function(cand)
+			if trial.nodes[cand.id] or not values[cand.id] or trial.count - state.count + cand.dist > self.anchorMaxAdded then
+				return 0
+			end
+			return weightOf(cand)
+		end)
+		if not pick then
+			break
+		end
+		connect(pick, d2, p2)
+		t_insert(anchors, pick.node)
+	end
+	if trial.count - state.count > self.anchorMaxAdded then
+		return nil
+	end
+	local names = { }
+	for _, node in ipairs(anchors) do
+		t_insert(names, node.dn or node.name or tostring(node.id))
+		self.anchorTried[baseKey .. ">" .. node.id] = true
+	end
+	local record = { anchors = names, added = trial.count - state.count, before = base.score }
+	t_insert(self.anchorKicks, record)
+
+	-- The paths stay while the rest of the tree is cut back and refined
+	local addedMust = { }
+	for id in pairs(locked) do
+		if not self.mustHave[id] then
+			self.mustHave[id] = true
+			addedMust[id] = true
+		end
+	end
+	local function release()
+		for id in pairs(addedMust) do
+			self.mustHave[id] = nil
+		end
+	end
+	while trial.count > budget and not self.stopped do
+		local cheapest, cheapestLoss
+		for _, branch in ipairs(self:RemovableBranches(trial, self.maxBranchSize)) do
+			local loss = lossOf(trial, branch)
+			if not cheapestLoss or loss < cheapestLoss then
+				cheapest, cheapestLoss = branch, loss
+			end
+		end
+		if not cheapest then
+			break
+		end
+		for _, id in ipairs(cheapest.ids) do
+			self:RemoveNode(trial, id)
+		end
+	end
+	if trial.count > budget or self.stopped then
+		release()
+		record.failed = true
+		return nil
+	end
+	self:Fill(trial, budget)
+	record.trimmed = self:Evaluate(trial).score
+	local slice = self.timeLimit * self.anchorSlice
+	trial = self:Refine(trial, budget, self:Now() + slice)
+	record.locked = self:Evaluate(trial).score
+	release()
+	if not self.stopped then
+		trial = self:Refine(trial, budget, self:Now() + slice)
+	end
+	local eval = self:Evaluate(trial)
+	record.after = eval.score
+	record.kept = self:IsBetter(eval, base)
+	record.found = { }
+	for _, node in ipairs(anchors) do
+		record.found[node.dn or node.name or tostring(node.id)] = trial.nodes[node.id] ~= nil
+	end
+	if not record.kept then
+		self.anchorFailures = self.anchorFailures or { }
+		for _, node in ipairs(anchors) do
+			self.anchorFailures[node.id] = (self.anchorFailures[node.id] or 0) + 1
+		end
+	end
+	return trial
+end
+
 -- Main entry point. Returns a result table; call :ApplyToNewSpec(result) to add it to the build.
 function TreeOptimizer:Run()
 	local startTime = self:Now()
@@ -2915,6 +3134,8 @@ function TreeOptimizer:Run()
 	local bestLosses, bestLossesFor = { }, nil
 	local perturbedFor, perturbFailures
 	local modelTime = 0
+	local anchorTime, anchorExhaustedFor = 0, nil
+	local plateauKicks = 0
 	-- From scratch, the fill's tree is refined before the model measures anything: the model's measuring is a large
 	-- fixed cost that only pays off on a tree that is already decent
 	local scratchRefined = not self.fromScratch
@@ -2948,6 +3169,21 @@ function TreeOptimizer:Run()
 					modelFailures = 0
 				end
 			end
+		elseif localOptima >= 1 and self.anchorShare > 0 and anchorExhaustedFor ~= bestKey
+			and anchorTime <= self.anchorShare * (self:Now() - startTime) then
+			self.phase = "anchor"
+			local anchorStart = self:Now()
+			if bestLossesFor ~= self.best then
+				bestLosses, bestLossesFor = { }, self.best
+			end
+			local trial, exhausted = self:AnchorKick(self.best, self.points, self:BranchLossFunction(bestLosses))
+			if trial then
+				self:Track(trial)
+				state = trial
+			elseif exhausted or not self.stopped then
+				anchorExhaustedFor = bestKey
+			end
+			anchorTime = anchorTime + self:Now() - anchorStart
 		elseif refinedKey ~= bestKey then
 			self.phase = "refine"
 			local trial = self:Refine(self:CopyState(self.best), self.points, deadline, true)
@@ -2965,8 +3201,23 @@ function TreeOptimizer:Run()
 				bestLosses, bestLossesFor = { }, self.best
 			end
 			self.phase = "far swap"
-			local trial = self:FarSwap(self.best, self.points, self:BranchLossFunction(bestLosses))
+			plateauKicks = plateauKicks + 1
+			local trial, anchored
+			if self.anchorPlateau > 0 and plateauKicks % self.anchorPlateau == 0 then
+				self.phase = "anchor"
+				trial = self:AnchorKick(self.best, self.points, self:BranchLossFunction(bestLosses))
+				anchored = trial ~= nil
+				self.phase = "far swap"
+			end
 			if not trial and not self.stopped then
+				trial = self:FarSwap(self.best, self.points, self:BranchLossFunction(bestLosses))
+			end
+			if anchored then
+				self:Track(trial)
+				state = trial
+				localOptima = localOptima + 1
+				trial = nil
+			elseif not trial and not self.stopped then
 				self.phase = "perturb"
 				-- Kicks that keep failing to lead anywhere better grow, so a deep local optimum is eventually left
 				if perturbedFor ~= self.best then
