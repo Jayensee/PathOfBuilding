@@ -36,8 +36,13 @@
 --        many is picked, and sums of single-node effects drift: caps and saturating stats like total EHP). So each
 --        prediction is lowered by a penalty learned from this run's own checks (mean predicted - real per distance
 --        band, interpolated by changed-node count: RecordCheck, DistancePenalty), which steers both the model search
---        and the choice of trees to check. The optional structured model is likewise kept only while its checks are
---        no worse than the plain sum's (StructuredWins).
+--        and the choice of trees to check. The structured model (on by default; it discovers the fields the score
+--        function reads and predicts each one, then runs the score function on the predicted output) is kept only while
+--        its checks are no worse than the plain sum's (StructuredWins). Saturating fields (total EHP, damage taken
+--        multipliers with a floor) overshoot far from the base, so every field is also calibrated on this run's checks
+--        (RecordFieldCheck): a factor in 0..1.2 on its summed log change, fitted by least squares and pulled towards 1
+--        while samples are few (FieldFactor), and a clamp to the range its real values have taken plus a margin
+--        (FieldClamp). Nothing there knows any field or the formula.
 --      - When the model rests (failed rounds with nothing left to measure), Refine runs on the best tree until its
 --        first improving move, so the model gets its turn on the better tree; at a local optimum, far swaps then
 --        random perturbation, each followed by Refine. Perturbation alternates between removing a few branches (more
@@ -96,7 +101,9 @@ local EPSILON = 1e-9
 ---@field timeLimit number? Seconds the whole run may take (the initial fill always completes).
 ---@field clock string? "evals" counts time in calculations (see DEFAULT_EVAL_TIME) so runs are deterministic; default is real time.
 ---@field evalTime number? Seconds one calculation counts for under the evals clock (default 0.015).
----@field structuredModel boolean? Predict the stat by running the score function on a predicted output (default false: it helps some builds and hurts others, see ModelFields), instead of summing log deltas of the stat itself. Falls back to the sum when its checks are worse.
+---@field structuredModel boolean? Predict the stat by running the score function on a predicted output (default true; each field's prediction is calibrated on the run's own checks, see FieldFactor), instead of summing log deltas of the stat itself. Falls back to the sum when its checks are worse.
+---@field fieldCalibration boolean? Calibrate each field of the structured model on the run's own checks: a factor on its summed log change and a clamp to the range its real values have taken (default true).
+---@field fieldClamp boolean? The clamp part of fieldCalibration (default true).
 ---@field scoreFunction fun(output: table): number? Replaces the power stat as the number to maximise (a function of the output table alone). Used by tests.
 ---@field distancePenalty boolean? Subtract from each model prediction the optimism the model's checks showed at that distance from its base (default true).
 ---@field logPredictions boolean? Record model predictions against the calculations that check them in self.predictionLog.
@@ -137,11 +144,14 @@ function TreeOptimizer.new(build, options)
 	self.captureFields = self.useModel
 	-- Structured model: the fields the score function reads are discovered from its first evaluations, and a tree's
 	-- stat is predicted by running the score function on a predicted output (see DiscoverFields)
-	self.structured = self.useModel and options.structuredModel == true
+	self.structured = self.useModel and options.structuredModel ~= false
 	-- What the model's checks have shown about its predictions (see RecordCheck)
 	self.distancePenalty = self.useModel and options.distancePenalty ~= false
 	self.calib = { buckets = { { n = 0, sum = 0 }, { n = 0, sum = 0 }, { n = 0, sum = 0 }, { n = 0, sum = 0 } },
-		curve = { { 0, 0 } }, n = 0, plainErr = 0, structErr = 0 }
+		curve = { { 0, 0 } }, n = 0, plainErr = 0, structErr = 0, fields = { } }
+	-- Per-field self-calibration of the structured model (see FieldFactor / FieldClamp)
+	self.fieldCalibration = self.structured and options.fieldCalibration ~= false
+	self.fieldClamp = self.fieldCalibration and options.fieldClamp ~= false
 	self.scoreFunction = options.scoreFunction
 	self.discRuns = 0
 	self.discPaths, self.discSet, self.discParts = { }, { }, { }
@@ -2217,6 +2227,8 @@ function TreeOptimizer:ModelEvaluate(model, state)
 		structScore = fields.structLogValue and (fields.structLogValue - deficitCost),
 		changed = changed,
 		predPaths = fields.predPaths,
+		rawPred = fields.rawPred,
+		basePaths = fields.basePaths,
 	}
 end
 
@@ -2263,12 +2275,62 @@ function TreeOptimizer:StructuredWins()
 	return calib.n < 3 or calib.structErr <= calib.plainErr * 1.05
 end
 
+-- Per-field self-calibration. Fields that saturate (total EHP, damage taken multipliers with a floor) don't follow the
+-- sum of the log changes of single nodes far from the base. Nothing here knows any field: from the checks of this run,
+-- each field learns (a) a factor on its summed log change (least squares of the real log change on the predicted one,
+-- pulled towards 1 while samples are few, kept within 0..1.2) and (b) the range its real values have taken, which its
+-- predictions may exceed only by a margin.
+local FIELD_PRIOR = 0.3 -- weight of "factor 1", in units of squared log change
+local FIELD_MARGIN = 0.25 -- share of the observed range a prediction may go beyond it
+local FIELD_MIN_CHECKS = 3
+function TreeOptimizer:FieldFactor(path)
+	local f = self.calib.fields[path]
+	if not f or f.n < 2 then
+		return 1
+	end
+	return m_max(0, m_min(1.2, (f.sxy + FIELD_PRIOR) / (f.sxx + FIELD_PRIOR)))
+end
+
+function TreeOptimizer:FieldClamp(path, value, base)
+	local f = self.calib.fields[path]
+	if not f or f.n < FIELD_MIN_CHECKS then
+		return value
+	end
+	local margin = FIELD_MARGIN * (f.hi - f.lo) + 0.05 * math.abs(base)
+	return m_max(f.lo - margin, m_min(f.hi + margin, value))
+end
+
+function TreeOptimizer:RecordFieldCheck(predicted, realFields)
+	local calib = self.calib
+	local baseFields = predicted.basePaths
+	for path, raw in pairs(predicted.rawPred) do
+		local base, real = baseFields[path], realFields[path]
+		if type(real) == "number" and real == real and type(base) == "number" and base > 0 then
+			local f = calib.fields[path]
+			if not f then
+				f = { n = 0, sxy = 0, sxx = 0, lo = base, hi = base }
+				calib.fields[path] = f
+			end
+			f.n = f.n + 1
+			f.lo, f.hi = m_min(f.lo, real), m_max(f.hi, real)
+			if raw > 0 and real > 0 then
+				local x, y = m_log(raw / base), m_log(real / base)
+				f.sxy = f.sxy + x * y
+				f.sxx = f.sxx + x * x
+			end
+		end
+	end
+end
+
 -- Learns from a model prediction (`predicted`, a ModelEvaluate result) and the calculation that checked it
 function TreeOptimizer:RecordCheck(predicted, real)
 	if not (predicted.rawScore and real.score > -math.huge and predicted.deficit == 0 and real.deficit == 0) then
 		return
 	end
 	local calib = self.calib
+	if predicted.rawPred and real.fields then
+		self:RecordFieldCheck(predicted, real.fields)
+	end
 	local bucket = calib.buckets[distanceBand(predicted.changed)]
 	bucket.n = bucket.n + 1
 	bucket.sum = bucket.sum + (predicted.rawScore - real.score)
@@ -2358,13 +2420,23 @@ end
 function TreeOptimizer:PredictLogValue(model, fields, logSum, rawSum)
 	local baseFields, logMode = model.baseFields, model.logMode
 	local predicted = setmetatable({ }, { __index = self.template })
-	local values = self.predictionLog and { } or nil
+	local values = (self.predictionLog or self.fieldCalibration) and { } or nil
+	local rawValues = self.fieldCalibration and { } or nil
 	fields.predPaths = values
+	fields.rawPred, fields.basePaths = rawValues, baseFields
 	for _, path in ipairs(self.discPaths) do
 		local value
 		local base = baseFields[path]
 		if logMode[path] then
-			value = base * math.exp(logSum[path] or 0) + (rawSum[path] or 0)
+			local sum = logSum[path] or 0
+			if rawValues then
+				rawValues[path] = base * math.exp(sum) + (rawSum[path] or 0)
+				sum = sum * self:FieldFactor(path)
+			end
+			value = base * math.exp(sum) + (rawSum[path] or 0)
+			if self.fieldClamp then
+				value = self:FieldClamp(path, value, base)
+			end
 		elseif base ~= nil or fields[path] ~= 0 then
 			value = fields[path]
 		else

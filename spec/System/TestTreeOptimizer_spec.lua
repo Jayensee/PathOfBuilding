@@ -105,6 +105,39 @@ describe("TreeOptimizer", function()
 			assert.is_true(sawLog)
 		end)
 
+		it("learns per field from its checks how far to trust the summed change, and clamps to what was observed", function()
+			local optimizer = run({ points = 12, fromScratch = true, scoreFunction = score, structuredModel = true, clock = "evals", timeLimit = 1.5, maxEvals = math.huge })
+			assert.is_true(optimizer.fieldCalibration)
+			local model = optimizer.model
+			local path = "Life"
+			local base = model.baseFields[path]
+			assert.is_true(base > 0)
+			assert.are.equal(1, optimizer:FieldFactor(path))
+			-- A saturating field: the real log change is half of the predicted one, and never goes below 0.5 * base
+			local function real(x)
+				return math.max(0.5 * base, base * math.exp(x / 2))
+			end
+			local function error(x)
+				local sum = x
+				local predicted = base * math.exp(sum * optimizer:FieldFactor(path))
+				predicted = optimizer:FieldClamp(path, predicted, base)
+				return math.abs(math.log(predicted / real(x)))
+			end
+			local before = error(-3)
+			local beforeUp = error(1.5)
+			for _, x in ipairs({ -0.4, 0.3, -0.8, 0.6, -1.2, 1.0, -2, 0.2 }) do
+				optimizer:RecordFieldCheck({ rawPred = { [path] = base * math.exp(x) }, basePaths = { [path] = base } }, { [path] = real(x) })
+			end
+			local factor = optimizer:FieldFactor(path)
+			assert.is_true(factor > 0.4 and factor < 0.8)
+			-- Far past what was seen the calibrated prediction is closer, in both directions
+			assert.is_true(error(-3) < before)
+			assert.is_true(error(1.5) < beforeUp)
+			-- Without calibration nothing is learned
+			local plain = run({ points = 12, fromScratch = true, scoreFunction = score, structuredModel = true, fieldCalibration = false, timeLimit = 0.01 })
+			assert.is_false(plain.fieldCalibration)
+		end)
+
 		it("falls back to the stat's own log when the structured model is off", function()
 			local optimizer = run({ points = 12, fromScratch = true, scoreFunction = score, structuredModel = false })
 			assert.is_false(optimizer.structured)
