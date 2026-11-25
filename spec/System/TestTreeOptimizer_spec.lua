@@ -632,6 +632,43 @@ describe("TreeOptimizer", function()
 		end)
 	end)
 
+	describe("stopping while trimming", function()
+		-- A stopped run that is still over budget must say it was stopped, not that must-have nodes don't fit
+		local function overBudgetState(optimizer)
+			local state = optimizer:NewState()
+			local added = 0
+			for _, node in pairs(build.spec.nodes) do
+				if node.type == "Normal" and not node.ascendancyName and added < 4 then
+					optimizer:AddNode(state, node)
+					added = added + 1
+				end
+			end
+			return state
+		end
+
+		it("reports a stop instead of a budget error", function()
+			local optimizer = TreeOptimizer.new(build, { powerStat = lifeStat, points = 1 })
+			local state = overBudgetState(optimizer)
+			optimizer.stopped = true
+			local ok, err = optimizer:Trim(state, 1)
+			assert.is_false(ok)
+			assert.is_truthy(err:match("^Stopped"))
+		end)
+
+		it("still reports the budget error when not stopped", function()
+			local optimizer = TreeOptimizer.new(build, { powerStat = lifeStat, points = 1 })
+			local state = optimizer:NewState()
+			local notable = findNotable(2)
+			optimizer:AddNode(state, notable)
+			-- the only node is a must-have, so nothing is removable
+			optimizer.mustHave = { [notable.id] = true }
+			local ok, err = optimizer:Trim(state, 0)
+			assert.is_false(ok)
+			assert.is_truthy(err)
+			assert.is_nil(err:match("^Stopped"))
+		end)
+	end)
+
 	it("toggles optimizer marks, ignoring ascendancy and start nodes", function()
 		local notable = assert(findNotable(2))
 		local treeTab = build.treeTab

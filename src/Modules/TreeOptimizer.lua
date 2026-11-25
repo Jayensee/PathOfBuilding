@@ -1241,6 +1241,10 @@ end
 
 -- Phase 3: trim to budget by removing the branch with the lowest loss per point
 
+-- Error when the run is stopped (Stop pressed, maxEvals hit) while Trim is still cutting the tree down to the budget:
+-- there is no tree within budget to return yet
+local TRIM_STOPPED = "Stopped before the tree was cut down to the point budget"
+
 function TreeOptimizer:Trim(state, budget)
 	while state.count > budget and not self.stopped do
 		local base = self:Evaluate(state)
@@ -1265,6 +1269,9 @@ function TreeOptimizer:Trim(state, budget)
 			t_sort(branches, function(a, b) return a.size < b.size end)
 			bestBranch = branches[1]
 			if not bestBranch then
+				if self.stopped then
+					return false, TRIM_STOPPED
+				end
 				return false, "Must-have nodes need more points than the budget allows"
 			end
 		end
@@ -1272,7 +1279,15 @@ function TreeOptimizer:Trim(state, budget)
 			self:RemoveNode(state, id)
 		end
 	end
-	return state.count <= budget, state.count > budget and "Must-have nodes need more points than the budget allows" or nil
+	if state.count <= budget then
+		return true
+	end
+	-- Over budget with the loop ended: either the run was stopped (Stop pressed, maxEvals hit) part-way through the
+	-- cut, or no branch could be removed
+	if self.stopped then
+		return false, TRIM_STOPPED
+	end
+	return false, "Must-have nodes need more points than the budget allows"
 end
 
 -- Furthest the fill reaches when nothing nearer improves the tree
