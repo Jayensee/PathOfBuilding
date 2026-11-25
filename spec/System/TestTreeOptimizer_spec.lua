@@ -37,6 +37,30 @@ describe("TreeOptimizer", function()
 		return best
 	end
 
+	describe("evaluation clock", function()
+		local function fingerprint(optimizer, result)
+			local ids = { }
+			for id in pairs(result.best.nodes) do
+				table.insert(ids, id)
+			end
+			table.sort(ids)
+			return table.concat(ids, ",") .. string.format("|%.17g|%d", result.bestEval.score, optimizer.evalCount)
+		end
+
+		it("gives identical results for the same seed, whatever the machine does", function()
+			local options = { clock = "evals", evalTime = 0.015, timeLimit = 1.2, maxEvals = math.huge, points = 12, fromScratch = true, seed = 3, logPredictions = true }
+			local first, firstResult = run(copyTable(options))
+			-- Burn CPU in between: real time must not matter
+			local spin = os.clock()
+			while os.clock() - spin < 0.3 do end
+			local second, secondResult = run(copyTable(options))
+			assert.are.equal(fingerprint(first, firstResult), fingerprint(second, secondResult))
+			assert.are.equal(#first.predictionLog, #second.predictionLog)
+			-- The budget is counted in calculations (1.2s at 15ms is 80, shared with the model search)
+			assert.is_true(first.evalCount > 10 and first.evalCount < 80 + 40)
+		end)
+	end)
+
 	it("fills the budget with a connected tree that improves the stat", function()
 		local optimizer, result = run({ points = 12, fromScratch = true })
 		assert.is_true(result.best.count <= 12)

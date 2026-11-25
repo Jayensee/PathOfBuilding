@@ -60,6 +60,15 @@ local function now()
 	return ms > 0 and ms / 1000 or os.clock()
 end
 
+-- Evaluation clock (option clock = "evals"): time is counted in calculations instead of read from the machine, so a
+-- run depends only on its seed, never on CPU speed or load. One calculation takes `evalTime` seconds. Work that
+-- calculates nothing is charged too: each model prediction costs PREDICTION_COST of a calculation, and every read of
+-- the clock a little more (CLOCK_READ_COST), which keeps any loop that only reads the clock moving.
+local DEFAULT_EVAL_TIME = 0.015
+-- Measured: a search of the model makes ~3000 predictions per CPU second against ~80 calculations
+local PREDICTION_COST = 0.027
+local CLOCK_READ_COST = 0.0001
+
 -- Log-score cost of each missing attribute point. 10 missing points cost ~18% of the stat.
 local ATTRIBUTE_PENALTY = 0.02
 -- Log-score cost of each deficit point when comparing trees that don't meet the requirements (see Merit). Large enough
@@ -79,6 +88,9 @@ local EPSILON = 1e-9
 ---@field maxPathLength number? Furthest an added path can reach in one step.
 ---@field maxBranchSize number? Largest branch the refine phase may remove in one move.
 ---@field timeLimit number? Seconds the whole run may take (the initial fill always completes).
+---@field clock string? "evals" counts time in calculations (see DEFAULT_EVAL_TIME) so runs are deterministic; default is real time.
+---@field evalTime number? Seconds one calculation counts for under the evals clock (default 0.015).
+---@field logPredictions boolean? Record model predictions against the calculations that check them in self.predictionLog.
 ---@field maxEvals number? Hard cap on the number of calculations.
 ---@field onProgress fun(info: table)? Called after every calculation. Running inside a coroutine, it may yield.
 ---@field shouldStop fun(): boolean? Polled after every calculation; returning true ends the run with the best tree so far.
@@ -99,6 +111,12 @@ function TreeOptimizer.new(build, options)
 	self.maxBranchSize = options.maxBranchSize or 6
 	self.timeLimit = options.timeLimit or 60
 	self.maxEvals = options.maxEvals or math.huge
+	self.evalClock = options.clock == "evals"
+	self.evalTime = options.evalTime or DEFAULT_EVAL_TIME
+	-- Shared by reference with the model search's proxy, which reads and charges the same clock
+	self.virtualClock = { extra = 0 }
+	-- A list when set: how well the model's predictions matched the calculations that checked them
+	self.predictionLog = options.logPredictions and { } or nil
 	self.onProgress = options.onProgress
 	self.shouldStop = options.shouldStop
 	self.useFullDPS = true
@@ -131,6 +149,16 @@ function TreeOptimizer.new(build, options)
 	self.phase = "init"
 	self.stopped = false
 	return self
+end
+
+-- Every time read in the optimizer goes through here: real time (the app; CPU time headless) unless the evals clock is on.
+function TreeOptimizer:Now()
+	if self.evalClock then
+		local clock = self.virtualClock
+		clock.extra = clock.extra + CLOCK_READ_COST
+		return (self.evalCount + clock.extra) * self.evalTime
+	end
+	return now()
 end
 
 -- Jewel sockets are ordinary nodes that carry the jewel socketed in them: the calculator applies a jewel exactly when
@@ -735,13 +763,13 @@ function TreeOptimizer:Evaluate(state)
 	state.eval = result
 	self.evalCount = self.evalCount + 1
 	if self.onProgress then
-		self.onProgress({ phase = self.phase, evals = self.evalCount, best = self.best and self.best.eval, elapsed = now() - (self.startTime or now()), timeLimit = self.timeLimit })
+		self.onProgress({ phase = self.phase, evals = self.evalCount, best = self.best and self.best.eval, elapsed = self:Now() - (self.startTime or self:Now()), timeLimit = self.timeLimit })
 	end
 	if (self.shouldStop and self.shouldStop()) or self.evalCount >= self.maxEvals then
 		self.stopped = true
 	end
 	-- Past the time limit, every search loop winds down the same way as when stopped
-	if not self.stopped and self.deadline and now() >= self.deadline then
+	if not self.stopped and self.deadline and self:Now() >= self.deadline then
 		self.stopped = true
 		self.timeUp = true
 	end
@@ -1285,7 +1313,7 @@ function TreeOptimizer:Refine(state, budget, deadline, once)
 	end
 	local improved = true
 	local passes = 0
-	while improved and not self.stopped and now() < deadline and not (once and passes > 0) do
+	while improved and not self.stopped and self:Now() < deadline and not (once and passes > 0) do
 		passes = passes + 1
 		improved = false
 		local base = self:Evaluate(state)
@@ -1300,7 +1328,7 @@ function TreeOptimizer:Refine(state, budget, deadline, once)
 		t_sort(branches, function(a, b) return a.loss < b.loss end)
 
 		for _, branch in ipairs(branches) do
-			if self.stopped or now() >= deadline then
+			if self.stopped or self:Now() >= deadline then
 				break
 			end
 			local key = branch.key
@@ -1325,7 +1353,7 @@ function TreeOptimizer:Refine(state, budget, deadline, once)
 			end
 		end
 		-- No single branch swap helps: try moves that change several places at once
-		if not improved and not self.stopped and now() < deadline then
+		if not improved and not self.stopped and self:Now() < deadline then
 			local trial = self:Reroute(state)
 			if not trial and not self.stopped then
 				trial = self:FarSwap(state, budget, self:BranchLossFunction(branchLoss))
@@ -2003,7 +2031,7 @@ function TreeOptimizer:BuildModel(base, deadline)
 	local model = self:NewModel()
 	self:RebaseModel(model, base)
 	for _, task in ipairs(self:ModelTasks(model)) do
-		if self.stopped or (deadline and now() >= deadline) then
+		if self.stopped or (deadline and self:Now() >= deadline) then
 			return nil
 		end
 		self:MeasureModelTask(model, task)
@@ -2102,14 +2130,14 @@ function TreeOptimizer:ModelRound(deadline)
 	self.phase = "node values"
 	local tasks = self:ModelTasks(model)
 	local startEvals = self.evalCount
-	local measureStart = now()
+	local measureStart = self:Now()
 	local chunk = MODEL_CHUNK_MIN * MODEL_CHUNK_GROWTH ^ (model.chunks or 0)
 	local done = 0
 	for i, task in ipairs(tasks) do
 		local spent = self.evalCount - startEvals
-		if self.stopped or now() >= deadline
+		if self.stopped or self:Now() >= deadline
 			or (spent >= chunk and math.floor(task.priority) ~= math.floor(tasks[i - 1].priority))
-			or (i > 1 and now() - measureStart >= self.timeLimit * (self.modelMeasureShare or MODEL_MEASURE_SHARE)) then
+			or (i > 1 and self:Now() - measureStart >= self.timeLimit * (self.modelMeasureShare or MODEL_MEASURE_SHARE)) then
 			break
 		end
 		self:MeasureModelTask(model, task)
@@ -2118,9 +2146,9 @@ function TreeOptimizer:ModelRound(deadline)
 	if self.evalCount > startEvals then
 		model.chunks = (model.chunks or 0) + 1
 	end
-	local measureTime = now() - measureStart
+	local measureTime = self:Now() - measureStart
 	local pending = #tasks > done
-	if self.stopped or now() >= deadline or model.searched then
+	if self.stopped or self:Now() >= deadline or model.searched then
 		return nil, pending
 	end
 	model.searched = true
@@ -2128,7 +2156,7 @@ function TreeOptimizer:ModelRound(deadline)
 	-- A copy of the optimizer that scores trees with the model. It shares the graph and settings, but has its own
 	-- caches and bookkeeping so nothing predicted leaks into the real search.
 	self.phase = "model search"
-	local searchStart = now()
+	local searchStart = self:Now()
 	local searchTime = m_max(MODEL_SEARCH_MIN, MODEL_SEARCH_SHARE * measureTime)
 	local searchDeadline = m_min(deadline, searchStart + m_min(searchTime, MODEL_SEARCH_TIME))
 	local startTime, lastFound, startDeadline = searchStart, searchStart, searchDeadline
@@ -2141,17 +2169,20 @@ function TreeOptimizer:ModelRound(deadline)
 		if not state.eval then
 			state.eval = self:ModelEvaluate(model, state) or unknown
 			predictions = predictions + 1
+			if self.evalClock then
+				self.virtualClock.extra = self.virtualClock.extra + PREDICTION_COST
+			end
 			-- Predictions don't go through the real Evaluate, so report progress (letting the UI run) and honour Stop here.
 			-- The search also ends once it stops finding better trees.
 			if predictions % 50 == 0 then
 				if self.onProgress then
-					self.onProgress({ phase = self.phase, evals = self.evalCount, best = self.best and self.best.eval, elapsed = now() - self.startTime, timeLimit = self.timeLimit })
+					self.onProgress({ phase = self.phase, evals = self.evalCount, best = self.best and self.best.eval, elapsed = self:Now() - self.startTime, timeLimit = self.timeLimit })
 				end
 				if self.shouldStop and self.shouldStop() then
 					self.stopped = true
 					p.stopped = true
 				end
-				local t = now()
+				local t = self:Now()
 				if t >= startDeadline or t - lastFound > m_max(MODEL_SEARCH_STALL, lastFound - startTime) then
 					p.stopped = true
 				end
@@ -2193,7 +2224,8 @@ function TreeOptimizer:ModelRound(deadline)
 			if changed <= limit and (not bestWithin[i] or self:IsBetter(eval, bestWithin[i].eval)) then
 				entry = entry or { state = p:CopyState(state), eval = eval, key = key }
 				bestWithin[i] = entry
-				lastFound = now()
+				entry.predicted = not real
+				lastFound = self:Now()
 			end
 		end
 		if #top < MODEL_CHECKS or self:IsBetter(eval, top[#top].eval) then
@@ -2202,10 +2234,10 @@ function TreeOptimizer:ModelRound(deadline)
 					return
 				end
 			end
-			t_insert(top, entry or { state = p:CopyState(state), eval = eval, key = key })
+			t_insert(top, entry or { state = p:CopyState(state), eval = eval, key = key, predicted = not real })
 			t_sort(top, better)
 			top[MODEL_CHECKS + 1] = nil
-			lastFound = now()
+			lastFound = self:Now()
 		end
 	end
 
@@ -2222,7 +2254,7 @@ function TreeOptimizer:ModelRound(deadline)
 			break
 		end
 		proxy.stopped = false
-		startTime = now()
+		startTime = self:Now()
 		lastFound = startTime
 		startDeadline = m_min(searchDeadline, startTime + (searchDeadline - startTime) / (#starts - i + 1))
 		local trial = proxy:CopyState(start)
@@ -2230,7 +2262,7 @@ function TreeOptimizer:ModelRound(deadline)
 		proxy:Fill(trial, self.points)
 		local current = proxy:Refine(trial, self.points, startDeadline)
 		local kicks, kickFailures = 0, 0
-		while not proxy.stopped and now() < startDeadline do
+		while not proxy.stopped and self:Now() < startDeadline do
 			kicks = kicks + 1
 			local perturbed
 			if kicks % 3 == 0 then
@@ -2274,6 +2306,16 @@ function TreeOptimizer:ModelRound(deadline)
 			state.eval = nil
 			local eval = self:Evaluate(state)
 			self:Track(state)
+			if self.predictionLog and candidate.predicted and candidate.eval.score > -math.huge then
+				local predicted = candidate.eval
+				t_insert(self.predictionLog, {
+					predScore = predicted.score, realScore = eval.score,
+					predDeficit = predicted.deficit, realDeficit = eval.deficit,
+					baseScore = baseEval.score, baseDeficit = baseEval.deficit,
+					predBetter = self:IsBetter(predicted, baseEval), realBetter = self:IsBetter(eval, baseEval),
+					changed = changedNodes(candidate.state, base), evals = self.evalCount,
+				})
+			end
 			-- A tree that is stronger but misses a requirement by a little (the model reads the requirements less
 			-- accurately than the stat) gets a repair
 			if eval.deficit > 0 and baseEval.deficit == 0 and eval.value > baseEval.value and repairs < MODEL_REPAIRS then
@@ -2367,7 +2409,7 @@ end
 
 -- Main entry point. Returns a result table; call :ApplyToNewSpec(result) to add it to the build.
 function TreeOptimizer:Run()
-	local startTime = now()
+	local startTime = self:Now()
 	self.startTime = startTime
 	local state = self:NewState()
 
@@ -2422,7 +2464,7 @@ function TreeOptimizer:Run()
 		self:Track(state)
 		repaired = self.best
 	end
-	local fillTime = now() - startTime
+	local fillTime = self:Now() - startTime
 	local fillEvals = self.evalCount
 
 	-- Phase 4c: the thorough fill, from the same start. It is kept to a share of the time limit, and only started when the
@@ -2446,7 +2488,7 @@ function TreeOptimizer:Run()
 			self.stopped, self.timeUp = false, false
 		end
 		self.deadline = nil
-		thoroughTime, thoroughEvals = now() - startTime, self.evalCount
+		thoroughTime, thoroughEvals = self:Now() - startTime, self.evalCount
 		repaired = nil
 	end
 	local afterFill = self:CopyState(quick and self.best or state)
@@ -2471,7 +2513,7 @@ function TreeOptimizer:Run()
 	-- From scratch, the fill's tree is refined before the model measures anything: the model's measuring is a large
 	-- fixed cost that only pays off on a tree that is already decent
 	local scratchRefined = not self.fromScratch
-	while not self.stopped and now() < deadline do
+	while not self.stopped and self:Now() < deadline do
 		local bestKey = stateKey(self.best)
 		if self.best.eval.deficit > 0 and repaired ~= self.best then
 			-- A best tree that misses its requirements gets one repair before anything else is tried on it
@@ -2483,15 +2525,15 @@ function TreeOptimizer:Run()
 		elseif not scratchRefined then
 			scratchRefined = true
 			self.phase = "refine"
-			local refineDeadline = m_min(deadline, now() + self.timeLimit * 0.25)
+			local refineDeadline = m_min(deadline, self:Now() + self.timeLimit * 0.25)
 			local trial = self:Refine(self:CopyState(self.best), self.points, refineDeadline)
 			self:Track(trial)
 			state = trial
-		elseif self.useModel and modelRestingAt ~= bestKey and modelTime <= modelShare * (now() - startTime) then
+		elseif self.useModel and modelRestingAt ~= bestKey and modelTime <= modelShare * (self:Now() - startTime) then
 			modelRounds = modelRounds + 1
-			local roundStart = now()
+			local roundStart = self:Now()
 			local found, pending = self:ModelRound(deadline)
-			modelTime = modelTime + now() - roundStart
+			modelTime = modelTime + self:Now() - roundStart
 			if found then
 				modelFailures = 0
 			else
@@ -2506,7 +2548,7 @@ function TreeOptimizer:Run()
 			local trial = self:Refine(self:CopyState(self.best), self.points, deadline, true)
 			self:Track(trial)
 			state = trial
-			if stateKey(self.best) == bestKey and not self.stopped and now() < deadline then
+			if stateKey(self.best) == bestKey and not self.stopped and self:Now() < deadline then
 				-- Nothing improved the best tree: it is a local optimum
 				refinedKey = bestKey
 				localOptima = localOptima + 1
@@ -2557,7 +2599,7 @@ function TreeOptimizer:Run()
 		fillTime = fillTime,
 		thoroughEvals = thoroughEvals,
 		thoroughTime = thoroughTime,
-		time = now() - startTime,
+		time = self:Now() - startTime,
 		stopped = self.stopped and not self.timeUp,
 	}
 end
