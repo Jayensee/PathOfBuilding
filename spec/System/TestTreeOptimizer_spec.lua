@@ -266,8 +266,8 @@ describe("TreeOptimizer", function()
 
 	describe("multi-point moves", function()
 		-- Greedy tree built from single node steps, so notables a few points away are never taken
-		local function shortSightedTree(points)
-			local optimizer = TreeOptimizer.new(build, { powerStat = lifeStat, points = points, fromScratch = true, maxPathLength = 1 })
+		local function shortSightedTree(points, clock)
+			local optimizer = TreeOptimizer.new(build, { powerStat = lifeStat, points = points, fromScratch = true, maxPathLength = 1, clock = clock })
 			local state = optimizer:NewState()
 			optimizer:Fill(state, points)
 			return optimizer, state
@@ -294,7 +294,7 @@ describe("TreeOptimizer", function()
 
 		it("kicks with far anchors: connected, within budget, must-haves restored, deterministic", function()
 			local function kick()
-				local optimizer, state = shortSightedTree(40)
+				local optimizer, state = shortSightedTree(40, "evals")
 				optimizer.timeLimit = 5
 				optimizer.maxEvals = 800
 				local mustBefore = copyTable(optimizer.mustHave, true)
@@ -307,6 +307,24 @@ describe("TreeOptimizer", function()
 				return optimizer:Evaluate(after).score
 			end
 			assert.are.equal(kick(), kick())
+		end)
+
+		it("stops a kick at once: no calculations past the stop, tree connected and within budget, must-haves restored", function()
+			for _, limit in ipairs({ 17, 30, 45, 76 }) do
+				local optimizer, state = shortSightedTree(40, "evals")
+				optimizer.timeLimit = 5
+				optimizer.startTime = optimizer:Now()
+				local mustBefore = copyTable(optimizer.mustHave, true)
+				local start = optimizer.evalCount
+				optimizer.shouldStop = function() return optimizer.evalCount - start >= limit end
+				local after = optimizer:AnchorKick(state, 40, optimizer:BranchLossFunction({ }))
+				assert.is_true(optimizer.evalCount - start <= limit + 3, "calculations past the stop at " .. limit)
+				if after then
+					assert.is_true(after.count <= 40)
+					assertConnected(optimizer, after)
+				end
+				assert.are.same(mustBefore, optimizer.mustHave)
+			end
 		end)
 
 		it("runs with the anchor kicks switched off or at every plateau", function()

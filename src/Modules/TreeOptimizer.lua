@@ -3008,12 +3008,16 @@ function TreeOptimizer:AnchorKick(state, budget, lossOf)
 	while trial.count > budget and not self.stopped do
 		local cheapest, cheapestLoss
 		for _, branch in ipairs(self:RemovableBranches(trial, self.maxBranchSize)) do
+			-- Once stopped, the other branches are not calculated (each would be a calculation past the limit)
+			if self.stopped then
+				break
+			end
 			local loss = lossOf(trial, branch)
 			if not cheapestLoss or loss < cheapestLoss then
 				cheapest, cheapestLoss = branch, loss
 			end
 		end
-		if not cheapest then
+		if not cheapest or self.stopped then
 			break
 		end
 		for _, id in ipairs(cheapest.ids) do
@@ -3026,17 +3030,22 @@ function TreeOptimizer:AnchorKick(state, budget, lossOf)
 		return nil
 	end
 	self:Fill(trial, budget)
-	record.trimmed = self:Evaluate(trial).score
 	local slice = self.timeLimit * self.anchorSlice
-	trial = self:Refine(trial, budget, self:Now() + slice)
-	record.locked = self:Evaluate(trial).score
+	-- Once stopped nothing more is calculated here: the caller tracks the tree it gets back
+	if not self.stopped then
+		record.trimmed = self:Evaluate(trial).score
+		trial = self:Refine(trial, budget, self:Now() + slice)
+	end
+	if not self.stopped then
+		record.locked = self:Evaluate(trial).score
+	end
 	release()
 	if not self.stopped then
 		trial = self:Refine(trial, budget, self:Now() + slice)
 	end
-	local eval = self:Evaluate(trial)
+	local eval = self.stopped and base or self:Evaluate(trial)
 	record.after = eval.score
-	record.kept = self:IsBetter(eval, base)
+	record.kept = not self.stopped and self:IsBetter(eval, base)
 	record.found = { }
 	for _, node in ipairs(anchors) do
 		record.found[node.dn or node.name or tostring(node.id)] = trial.nodes[node.id] ~= nil
