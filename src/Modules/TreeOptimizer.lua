@@ -32,6 +32,12 @@
 --        first, reusing measurements from earlier base trees as estimates), searches a cheap additive model of the
 --        score with the moves above, and checks its best trees with full calculations (see "Node value model").
 --        Rounds go on while they find better trees or have nodes left to measure.
+--        Predictions are optimistic, and the more so the more nodes a tree changes from the model's base (the best of
+--        many is picked, and sums of single-node effects drift: caps and saturating stats like total EHP). So each
+--        prediction is lowered by a penalty learned from this run's own checks (mean predicted - real per distance
+--        band, interpolated by changed-node count: RecordCheck, DistancePenalty), which steers both the model search
+--        and the choice of trees to check. The optional structured model is likewise kept only while its checks are
+--        no worse than the plain sum's (StructuredWins).
 --      - When the model rests (failed rounds with nothing left to measure), Refine runs on the best tree until its
 --        first improving move, so the model gets its turn on the better tree; at a local optimum, far swaps then
 --        random perturbation, each followed by Refine. Perturbation alternates between removing a few branches (more
@@ -90,8 +96,9 @@ local EPSILON = 1e-9
 ---@field timeLimit number? Seconds the whole run may take (the initial fill always completes).
 ---@field clock string? "evals" counts time in calculations (see DEFAULT_EVAL_TIME) so runs are deterministic; default is real time.
 ---@field evalTime number? Seconds one calculation counts for under the evals clock (default 0.015).
----@field structuredModel boolean? Predict the stat by running the score function on a predicted output (default false: mixed results), instead of summing log deltas of the stat itself.
+---@field structuredModel boolean? Predict the stat by running the score function on a predicted output (default false: it helps some builds and hurts others, see ModelFields), instead of summing log deltas of the stat itself. Falls back to the sum when its checks are worse.
 ---@field scoreFunction fun(output: table): number? Replaces the power stat as the number to maximise (a function of the output table alone). Used by tests.
+---@field distancePenalty boolean? Subtract from each model prediction the optimism the model's checks showed at that distance from its base (default true).
 ---@field logPredictions boolean? Record model predictions against the calculations that check them in self.predictionLog.
 ---@field maxEvals number? Hard cap on the number of calculations.
 ---@field onProgress fun(info: table)? Called after every calculation. Running inside a coroutine, it may yield.
@@ -131,6 +138,10 @@ function TreeOptimizer.new(build, options)
 	-- Structured model: the fields the score function reads are discovered from its first evaluations, and a tree's
 	-- stat is predicted by running the score function on a predicted output (see DiscoverFields)
 	self.structured = self.useModel and options.structuredModel == true
+	-- What the model's checks have shown about its predictions (see RecordCheck)
+	self.distancePenalty = self.useModel and options.distancePenalty ~= false
+	self.calib = { buckets = { { n = 0, sum = 0 }, { n = 0, sum = 0 }, { n = 0, sum = 0 }, { n = 0, sum = 0 } },
+		curve = { { 0, 0 } }, n = 0, plainErr = 0, structErr = 0 }
 	self.scoreFunction = options.scoreFunction
 	self.discRuns = 0
 	self.discPaths, self.discSet, self.discParts = { }, { }, { }
@@ -759,6 +770,18 @@ function TreeOptimizer:DiscoverFields(output, value)
 	if self.discRuns >= DISCOVERY_RUNS and #self.discPaths == 0 then
 		self.structured = false
 	end
+end
+
+-- The discovered fields' values in a captured field table (for the prediction log)
+function TreeOptimizer:DiscoveredValues(fields)
+	if not (self.structured and fields) then
+		return nil
+	end
+	local values = { }
+	for _, path in ipairs(self.discPaths) do
+		values[path] = fields[path]
+	end
+	return values
 end
 
 function TreeOptimizer:ScoreFromOutput(output)
@@ -2160,18 +2183,94 @@ end
 
 -- Predicted evaluation of `state`, or nil if it uses a node the model didn't measure
 function TreeOptimizer:ModelEvaluate(model, state)
-	local fields = self:ModelFields(model, state)
+	local fields, changed = self:ModelFields(model, state)
 	if not fields then
 		return nil
 	end
 	local deficit, attributes, violations = self:ConstraintDeficit(fields)
+	local penalty = self.distancePenalty and self:DistancePenalty(changed) or 0
+	local deficitCost = deficit * ATTRIBUTE_PENALTY
 	return {
-		value = math.exp(fields.logValue),
+		value = math.exp(fields.logValue - penalty),
 		deficit = deficit,
 		attributes = attributes,
 		violations = violations,
-		score = fields.logValue - deficit * ATTRIBUTE_PENALTY,
+		score = fields.logValue - penalty - deficitCost,
+		-- What the model really predicts, before the pessimism for the distance (the prediction log and RecordCheck)
+		rawScore = fields.logValue - deficitCost,
+		plainScore = (fields.plainLogValue or fields.logValue) - deficitCost,
+		structScore = fields.structLogValue and (fields.structLogValue - deficitCost),
+		changed = changed,
+		predPaths = fields.predPaths,
 	}
+end
+
+-- Pessimism, in log score, for a predicted tree that differs from the model's base in `changed` nodes. The model's
+-- predictions are optimistic (the best of many predictions is picked) and the more so the further the tree is from the
+-- base, so the checks of its predictions decide: RecordCheck keeps the mean (predicted - real) per distance band, and
+-- this interpolates it. Nothing is subtracted before the first checks.
+local DISTANCE_BANDS = { 5, 10, 20 } -- upper ends of the bands; the last one is open
+local BAND_CENTRES = { 3, 8, 15, 30 }
+local function distanceBand(changed)
+	for i, upper in ipairs(DISTANCE_BANDS) do
+		if changed <= upper then
+			return i
+		end
+	end
+	return #DISTANCE_BANDS + 1
+end
+
+function TreeOptimizer:DistancePenalty(changed)
+	local curve = self.calib.curve
+	local n = #curve
+	if n == 1 then
+		return 0
+	end
+	for i = 2, n do
+		local d0, b0 = curve[i - 1][1], curve[i - 1][2]
+		local d1, b1 = curve[i][1], curve[i][2]
+		if changed <= d1 then
+			return b0 + (b1 - b0) * (changed - d0) / (d1 - d0)
+		end
+	end
+	-- Beyond the last band measured: error grows faster than linearly with distance
+	local d1, b1 = curve[n][1], curve[n][2]
+	local slope = 2 * b1 / d1
+	if n > 2 then
+		slope = m_max(slope, (b1 - curve[n - 1][2]) / (d1 - curve[n - 1][1]))
+	end
+	return b1 + slope * (changed - d1)
+end
+
+-- Whether to predict with the structured model: until its checks show it less accurate than the sum of log deltas
+function TreeOptimizer:StructuredWins()
+	local calib = self.calib
+	return calib.n < 3 or calib.structErr <= calib.plainErr * 1.05
+end
+
+-- Learns from a model prediction (`predicted`, a ModelEvaluate result) and the calculation that checked it
+function TreeOptimizer:RecordCheck(predicted, real)
+	if not (predicted.rawScore and real.score > -math.huge and predicted.deficit == 0 and real.deficit == 0) then
+		return
+	end
+	local calib = self.calib
+	local bucket = calib.buckets[distanceBand(predicted.changed)]
+	bucket.n = bucket.n + 1
+	bucket.sum = bucket.sum + (predicted.rawScore - real.score)
+	if predicted.structScore then
+		calib.n = calib.n + 1
+		calib.plainErr = calib.plainErr + math.abs(predicted.plainScore - real.score)
+		calib.structErr = calib.structErr + math.abs(predicted.structScore - real.score)
+	end
+	-- Bands with a few checks give the bias (shrunk towards 0 while they are few); it never falls with distance
+	local curve, previous = { { 0, 0 } }, 0
+	for i, b in ipairs(calib.buckets) do
+		if b.n >= 2 then
+			previous = m_max(previous, b.sum / b.n * b.n / (b.n + 3))
+			t_insert(curve, { BAND_CENTRES[i], previous })
+		end
+	end
+	calib.curve = curve
 end
 
 -- Predicted values (log of the stat and everything the constraints read) of `state`, relative to the measured base
@@ -2181,6 +2280,7 @@ function TreeOptimizer:ModelFields(model, state)
 	local fields = copyTable(model.baseFields, true)
 	local structured = self.structured and #self.discPaths > 0
 	local logSum, rawSum, logMode = { }, { }, model.logMode
+	local changed = 0
 	local function apply(key, sign)
 		local entry = with[key]
 		if not entry then
@@ -2206,27 +2306,35 @@ function TreeOptimizer:ModelFields(model, state)
 	for id in pairs(state.nodes) do
 		local effectId = state.mastery[id]
 		if not base.nodes[id] then
+			changed = changed + 1
 			if not apply(nodeKey(id, effectId), 1) then
 				return nil
 			end
 		elseif effectId ~= base.mastery[id] then
+			changed = changed + 1
 			if not apply(nodeKey(id, effectId), 1) or not apply(nodeKey(id, base.mastery[id]), -1) then
 				return nil
 			end
 		end
 	end
 	for id in pairs(base.nodes) do
-		if not state.nodes[id] and not apply(nodeKey(id, base.mastery[id]), -1) then
-			return nil
+		if not state.nodes[id] then
+			changed = changed + 1
+			if not apply(nodeKey(id, base.mastery[id]), -1) then
+				return nil
+			end
 		end
 	end
 	if structured then
 		local predicted = self:PredictLogValue(model, fields, logSum, rawSum)
 		if predicted then
-			fields.logValue = predicted
+			fields.plainLogValue, fields.structLogValue = fields.logValue, predicted
+			if self:StructuredWins() then
+				fields.logValue = predicted
+			end
 		end
 	end
-	return fields
+	return fields, changed
 end
 
 -- Log of the score function on the output predicted for `fields`: the base's value of each discovered path moved by
@@ -2235,6 +2343,8 @@ end
 function TreeOptimizer:PredictLogValue(model, fields, logSum, rawSum)
 	local baseFields, logMode = model.baseFields, model.logMode
 	local predicted = setmetatable({ }, { __index = self.template })
+	local values = self.predictionLog and { } or nil
+	fields.predPaths = values
 	for _, path in ipairs(self.discPaths) do
 		local value
 		local base = baseFields[path]
@@ -2259,6 +2369,9 @@ function TreeOptimizer:PredictLogValue(model, fields, logSum, rawSum)
 			target = nested
 		end
 		target[parts[#parts]] = value
+		if values then
+			values[path] = value or nil
+		end
 	end
 	local ok, result = pcall(self.scoreFunc, predicted)
 	if not ok or type(result) ~= "number" or result ~= result then
@@ -2483,14 +2596,19 @@ function TreeOptimizer:ModelRound(deadline)
 			state.eval = nil
 			local eval = self:Evaluate(state)
 			self:Track(state)
+			if candidate.predicted then
+				self:RecordCheck(candidate.eval, eval)
+			end
 			if self.predictionLog and candidate.predicted and candidate.eval.score > -math.huge then
 				local predicted = candidate.eval
 				t_insert(self.predictionLog, {
-					predScore = predicted.score, realScore = eval.score,
+					predScore = predicted.rawScore or predicted.score, realScore = eval.score,
+					structScore = predicted.structScore,
 					predDeficit = predicted.deficit, realDeficit = eval.deficit,
 					baseScore = baseEval.score, baseDeficit = baseEval.deficit,
-					predBetter = self:IsBetter(predicted, baseEval), realBetter = self:IsBetter(eval, baseEval),
+					predBetter = self:IsBetter({ score = predicted.rawScore or predicted.score, deficit = predicted.deficit }, baseEval), realBetter = self:IsBetter(eval, baseEval),
 					changed = changedNodes(candidate.state, base), evals = self.evalCount,
+					predPaths = predicted.predPaths, plainScore = predicted.plainScore, realPaths = self:DiscoveredValues(eval.fields),
 				})
 			end
 			-- A tree that is stronger but misses a requirement by a little (the model reads the requirements less

@@ -61,6 +61,23 @@ describe("TreeOptimizer", function()
 		end)
 	end)
 
+	describe("distance penalty", function()
+		it("learns the model's optimism per distance from its checks and subtracts it", function()
+			local optimizer = run({ points = 12, fromScratch = true, timeLimit = 0.01 })
+			assert.are.equal(0, optimizer:DistancePenalty(40))
+			-- Predictions 0.01 too high within 5 nodes, 0.1 too high within 6-10, 0.4 beyond 20
+			for _, case in ipairs({ { 3, 0.01 }, { 8, 0.1 }, { 40, 0.4 } }) do
+				for _ = 1, 20 do
+					optimizer:RecordCheck({ rawScore = 1 + case[2], deficit = 0, changed = case[1] }, { score = 1, deficit = 0 })
+				end
+			end
+			local small, middle, large = optimizer:DistancePenalty(3), optimizer:DistancePenalty(8), optimizer:DistancePenalty(40)
+			assert.is_true(small > 0 and small < middle and middle < large)
+			assert.is_true(optimizer:DistancePenalty(60) > large)
+			assert.are.near(0.01 * 20 / 23, small, 1e-9)
+		end)
+	end)
+
 	describe("structured model", function()
 		-- A score function the optimizer knows nothing about: it reads Life and FireResist, nothing else
 		local function score(output)
