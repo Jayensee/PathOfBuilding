@@ -78,6 +78,37 @@ describe("TreeOptimizer", function()
 		end)
 	end)
 
+	describe("residual correction", function()
+		it("fits a correction per changed node from the residuals of the model's checks", function()
+			local optimizer = run({ points = 12, fromScratch = true, timeLimit = 0.01, residualCorrection = true })
+			local base = optimizer:CopyState(optimizer.best)
+			local model = { version = 1, base = base }
+			-- Two trees that drop the same node: the first check is 0.1 below its prediction, the second 0.3 below
+			local dropped
+			for id in pairs(base.nodes) do dropped = dropped or id end
+			local state = optimizer:CopyState(base)
+			state.nodes[dropped] = nil
+			optimizer:RecordResidual(model, state, { rawScore = 1, corr = 0, deficit = 0 }, { score = 0.9, deficit = 0 })
+			local first = optimizer.residual.c[dropped]
+			-- Dropping the node was predicted too well: the correction for having it is the residual undone, so positive here
+			assert.is_true(first > 0 and first < 0.1)
+			optimizer:RecordResidual(model, state, { rawScore = 1, corr = 0, deficit = 0 }, { score = 0.7, deficit = 0 })
+			assert.is_true(optimizer.residual.c[dropped] > first)
+		end)
+
+		it("runs deterministically and logs predictions before and after the correction", function()
+			local options = { clock = "evals", evalTime = 0.015, timeLimit = 1.2, maxEvals = math.huge, points = 12, fromScratch = true, seed = 3, logPredictions = true, residualCorrection = true }
+			local first = run(copyTable(options))
+			local second = run(copyTable(options))
+			assert.are.equal(#first.predictionLog, #second.predictionLog)
+			assert.are.equal(first.evalCount, second.evalCount)
+			for i, entry in ipairs(first.predictionLog) do
+				assert.is_number(entry.uncorrScore)
+				assert.are.equal(entry.predScore, second.predictionLog[i].predScore)
+			end
+		end)
+	end)
+
 	describe("structured model", function()
 		-- A score function the optimizer knows nothing about: it reads Life and FireResist, nothing else
 		local function score(output)

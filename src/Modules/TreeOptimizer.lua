@@ -116,6 +116,10 @@ local EPSILON = 1e-9
 ---@field modelRamp boolean? Raise the model's share of the run and its measuring spells between a quarter and a half of the time limit (default true in current mode; false keeps them constant; from scratch they always are).
 ---@field distancePenalty boolean? Subtract from each model prediction the optimism the model's checks showed at that distance from its base (default true).
 ---@field logPredictions boolean? Record model predictions against the calculations that check them in self.predictionLog.
+---@field residualCorrection boolean? Learn a per-node correction of the model's predicted log score from the residuals of the run's own checks (ridge regression over indicators of the nodes each checked tree added or removed, older checks decayed per rebase of the model) and add it to every prediction (default true; false turns it off).
+---@field residualOneSided boolean? Only let the correction lower predictions (a node's learned correction never raises a tree that adds it or removes a node it undervalued); the best of many predictions is picked, so raising them chases noise (default true).
+---@field residualLambda number? Ridge strength of residualCorrection, in units of weighted checks (default 0.3).
+---@field residualDecay number? Weight of a check per model rebase since it was made (default 0.85).
 ---@field adaptiveSchedule boolean? After adaptiveStart (0.25) of the run, a bandit chooses which search method (Refine, FarSwap, model round, anchor kick, perturbation) gets the next slice (adaptiveSlice, 0.05 of the limit) by the discounted gain per second each has produced in this run, with an optional minimum share (adaptiveMinShare, default 0) and an exploration bonus (adaptiveExplore, 0.3); default true, false keeps the fixed schedule.
 ---@field maxEvals number? Hard cap on the number of calculations.
 ---@field onProgress fun(info: table)? Called after every calculation. Running inside a coroutine, it may yield.
@@ -188,6 +192,8 @@ function TreeOptimizer.new(build, options)
 	self.structured = self.useModel and options.structuredModel == true
 	-- What the model's checks have shown about its predictions (see RecordCheck)
 	self.distancePenalty = self.useModel and options.distancePenalty ~= false
+	self.residual = options.residualCorrection ~= false and self.useModel and {
+		oneSided = options.residualOneSided ~= false, lambda = options.residualLambda or 0.3, decay = options.residualDecay or 0.85, checks = { }, c = { }, any = false } or nil
 	self.calib = { buckets = { { n = 0, sum = 0 }, { n = 0, sum = 0 }, { n = 0, sum = 0 }, { n = 0, sum = 0 } },
 		curve = { { 0, 0 } }, n = 0, plainErr = 0, structErr = 0, fields = { } }
 	-- Per-field self-calibration of the structured model (see FieldFactor / FieldClamp)
@@ -2274,6 +2280,7 @@ function TreeOptimizer:ModelEvaluate(model, state)
 		plainScore = (fields.plainLogValue or fields.logValue) - deficitCost,
 		structScore = fields.structLogValue and (fields.structLogValue - deficitCost),
 		changed = changed,
+		corr = fields.corr,
 		predPaths = fields.predPaths,
 		rawPred = fields.rawPred,
 		basePaths = fields.basePaths,
@@ -2398,6 +2405,78 @@ function TreeOptimizer:RecordCheck(predicted, real)
 	calib.curve = curve
 end
 
+-- Residual correction. Each check of a predicted tree gives residual = real score - uncorrected prediction. It is spread
+-- over the nodes the tree added (+1) or removed (-1) relative to the model's base by a ridge regression (coordinate
+-- descent from zero, checks weighted by decay per model rebase since they were made); the fitted corrections c[key] are
+-- added to every later prediction that adds those nodes (or subtracted where it removes them).
+local RESIDUAL_MAX_CHECKS = 300
+local RESIDUAL_SWEEPS = 8
+local RESIDUAL_CAP = 0.5
+function TreeOptimizer:RecordResidual(model, state, predicted, real)
+	local resid = self.residual
+	if not (resid and predicted.rawScore and real.score > -math.huge and predicted.deficit == 0 and real.deficit == 0) then
+		return
+	end
+	local base = model.base
+	local keys, signs = { }, { }
+	for id in pairs(state.nodes) do
+		local effectId = state.mastery[id]
+		if not base.nodes[id] then
+			t_insert(keys, nodeKey(id, effectId)); t_insert(signs, 1)
+		elseif effectId ~= base.mastery[id] then
+			t_insert(keys, nodeKey(id, effectId)); t_insert(signs, 1)
+			t_insert(keys, nodeKey(id, base.mastery[id])); t_insert(signs, -1)
+		end
+	end
+	for id in pairs(base.nodes) do
+		if not state.nodes[id] then
+			t_insert(keys, nodeKey(id, base.mastery[id])); t_insert(signs, -1)
+		end
+	end
+	if #keys == 0 then
+		return
+	end
+	local checks = resid.checks
+	t_insert(checks, { keys = keys, signs = signs, r = real.score - (predicted.rawScore - (predicted.corr or 0)), v = model.version })
+	if #checks > RESIDUAL_MAX_CHECKS then
+		table.remove(checks, 1)
+	end
+	local w, res, index, order = { }, { }, { }, { }
+	for i, ch in ipairs(checks) do
+		w[i] = resid.decay ^ (model.version - ch.v)
+		res[i] = ch.r
+		for j, key in ipairs(ch.keys) do
+			local list = index[key]
+			if not list then
+				list = { }
+				index[key] = list
+				t_insert(order, key)
+			end
+			t_insert(list, { i, ch.signs[j] })
+		end
+	end
+	local c = { }
+	for _ = 1, RESIDUAL_SWEEPS do
+		for _, key in ipairs(order) do
+			local old = c[key] or 0
+			local num, den = 0, resid.lambda
+			for _, e in ipairs(index[key]) do
+				local i, f = e[1], e[2]
+				num = num + w[i] * f * (res[i] + f * old)
+				den = den + w[i]
+			end
+			local new = m_max(-RESIDUAL_CAP, m_min(RESIDUAL_CAP, num / den))
+			if new ~= old then
+				for _, e in ipairs(index[key]) do
+					res[e[1]] = res[e[1]] - e[2] * (new - old)
+				end
+				c[key] = new
+			end
+		end
+	end
+	resid.c, resid.any = c, true
+end
+
 -- Predicted values (log of the stat and everything the constraints read) of `state`, relative to the measured base
 function TreeOptimizer:ModelFields(model, state)
 	local base = model.base
@@ -2458,6 +2537,33 @@ function TreeOptimizer:ModelFields(model, state)
 				fields.logValue = predicted
 			end
 		end
+	end
+	local resid = self.residual
+	if resid and resid.any then
+		local corr = 0
+		local c, oneSided = resid.c, resid.oneSided
+		local function term(key, sign)
+			local v = sign * (c[key] or 0)
+			if oneSided and v > 0 then
+				return 0
+			end
+			return v
+		end
+		for id in pairs(state.nodes) do
+			local effectId = state.mastery[id]
+			if not base.nodes[id] then
+				corr = corr + term(nodeKey(id, effectId), 1)
+			elseif effectId ~= base.mastery[id] then
+				corr = corr + term(nodeKey(id, effectId), 1) + term(nodeKey(id, base.mastery[id]), -1)
+			end
+		end
+		for id in pairs(base.nodes) do
+			if not state.nodes[id] then
+				corr = corr + term(nodeKey(id, base.mastery[id]), -1)
+			end
+		end
+		fields.logValue = fields.logValue + corr
+		fields.corr = corr
 	end
 	return fields, changed
 end
@@ -2752,11 +2858,12 @@ function TreeOptimizer:ModelRound(deadline)
 			self:Track(state)
 			if candidate.predicted then
 				self:RecordCheck(candidate.eval, eval)
+				self:RecordResidual(model, candidate.state, candidate.eval, eval)
 			end
 			if self.predictionLog and candidate.predicted and candidate.eval.score > -math.huge then
 				local predicted = candidate.eval
 				t_insert(self.predictionLog, {
-					predScore = predicted.rawScore or predicted.score, realScore = eval.score,
+					predScore = predicted.rawScore or predicted.score, uncorrScore = (predicted.rawScore or predicted.score) - (predicted.corr or 0), realScore = eval.score,
 					structScore = predicted.structScore,
 					predDeficit = predicted.deficit, realDeficit = eval.deficit,
 					baseScore = baseEval.score, baseDeficit = baseEval.deficit,

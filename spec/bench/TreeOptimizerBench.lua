@@ -387,6 +387,14 @@ local function predictionStats(log)
 	stats.bias = signed / #log -- predicted minus real: positive means the model is optimistic
 	stats.maeDeficit = defErr / defCount
 	stats.spearman = pearson(ranks(predicted), ranks(real))
+	if log[1].uncorrScore then
+		local un, uErr, uSigned = { }, 0, 0
+		for i, p in ipairs(log) do
+			un[i] = p.uncorrScore
+			uErr, uSigned = uErr + math.abs(p.uncorrScore - p.realScore), uSigned + p.uncorrScore - p.realScore
+		end
+		stats.uncorr = { maeScore = uErr / #log, bias = uSigned / #log, spearman = pearson(ranks(un), ranks(real)) }
+	end
 	stats.predBetter = predBetter
 	stats.precision = predBetter > 0 and bothBetter / predBetter or nil
 	stats.realBetter = realBetterCount
@@ -573,6 +581,9 @@ local function printResult(r)
 	end
 	local a = r.accuracy
 	if a and a.count > 0 then
+		if a.uncorr then
+			out("model predictions before correction: maeLog=%.4f bias=%+.4f spearman=%s\n", a.uncorr.maeScore, a.uncorr.bias, a.uncorr.spearman and string.format("%.3f", a.uncorr.spearman) or "-")
+		end
 		out("model predictions: n=%d maeLog=%.4f bias=%+.4f maeDeficit=%.3g spearman=%s predictedBetter=%d realBetter=%d precision=%s\n", a.count, a.maeScore, a.bias, a.maeDeficit, a.spearman and string.format("%.3f", a.spearman) or "-", a.predBetter, a.realBetter, a.precision and string.format("%.2f", a.precision) or "-")
 		for _, b in ipairs(a.buckets) do
 			if b.count > 0 then
