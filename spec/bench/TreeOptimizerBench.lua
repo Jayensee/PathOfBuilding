@@ -27,6 +27,7 @@
 --                  checkpoints are reported by evaluation count (250, 500, 1000, ... up to N) instead of seconds.
 --   BENCH_CLOCK    "evals" is the same as giving BENCH_EVALS (default budget 4000); "time" (default) is the CPU clock
 --   BENCH_EVALTIME nominal seconds per calculation under the evals clock (default 0.015)
+--   BENCH_PROBE    path of a Lua file returning function(optimizer, result), run on the finished optimizer (diagnostics)
 --   BENCH_DUMPLOG  any value: the JSON also carries every prediction log entry (per discovered field predicted and real values with the structured model)
 --
 -- Every run logs the model's predictions against the calculations that check them (optimizer.predictionLog) and
@@ -435,6 +436,13 @@ local function runOne(dir, file, mode, settings)
 	end
 	if result.error then
 		return { build = file, mode = mode, error = result.error }
+	end
+	local probe = env("BENCH_PROBE", nil)
+	if probe then
+		-- Diagnostics hook: a Lua file returning function(optimizer, result) run on the finished optimizer
+		optimizer.stopped, optimizer.timeUp, optimizer.deadline, optimizer.maxEvals = false, false, nil, math.huge
+		local okp, errp = pcall(assert(loadfile(probe))(), optimizer, result)
+		if not okp then out("probe error: %s", tostring(errp)) end
 	end
 	local init = result.initialEval
 	local function rel(e)

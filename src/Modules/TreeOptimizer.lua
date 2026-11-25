@@ -43,6 +43,9 @@
 --        (RecordFieldCheck): a factor in 0..1.2 on its summed log change, fitted by least squares and pulled towards 1
 --        while samples are few (FieldFactor), and a clamp to the range its real values have taken plus a margin
 --        (FieldClamp). Nothing there knows any field or the formula. These calibration options apply only when the structured model is on; on the 4000-eval benchmark the structured model scored worse overall (mean log ratio 0.432 vs 0.525 with it off), so it stays off by default.
+--        The model's share of the run (0.4) and the longest measuring spell of a round (0.08 of the time limit) rise to 0.6
+--        and 0.3 between a quarter and a half of the run (ModelShares): the later rounds measure the far nodes the early
+--        short ones never reach, which a 4 times longer run showed to hold notables worth +0.1 log on some builds.
 --      - When the model rests (failed rounds with nothing left to measure), Refine runs on the best tree until its
 --        first improving move, so the model gets its turn on the better tree; at a local optimum, far swaps then
 --        random perturbation, each followed by Refine. Perturbation alternates between removing a few branches (more
@@ -105,6 +108,7 @@ local EPSILON = 1e-9
 ---@field fieldCalibration boolean? Calibrate each field of the structured model on the run's own checks: a factor on its summed log change and a clamp to the range its real values have taken (default true).
 ---@field fieldClamp boolean? The clamp part of fieldCalibration (default true).
 ---@field scoreFunction fun(output: table): number? Replaces the power stat as the number to maximise (a function of the output table alone). Used by tests.
+---@field modelRamp boolean? Raise the model's share of the run and its measuring spells between a quarter and a half of the time limit (default true in current mode; false keeps them constant; from scratch they always are).
 ---@field distancePenalty boolean? Subtract from each model prediction the optimism the model's checks showed at that distance from its base (default true).
 ---@field logPredictions boolean? Record model predictions against the calculations that check them in self.predictionLog.
 ---@field maxEvals number? Hard cap on the number of calculations.
@@ -137,6 +141,7 @@ function TreeOptimizer.new(build, options)
 	self.shouldStop = options.shouldStop
 	self.useFullDPS = true
 	self.useModel = options.useModel ~= false
+	self.modelRamp = options.modelRamp
 	self.modelShare = options.modelShare
 	self.modelMeasureShare = options.modelMeasureShare
 	-- Keep the values the model needs from every calculation, so trees the search has calculated anyway (e.g. a
@@ -2490,6 +2495,25 @@ end
 -- One model round around the best tree: measure the next chunk of the model, search what it knows with the usual
 -- moves, then check the most promising trees it found with full calculations. Returns the best of those if it really
 -- beats the base, else nil, and whether measurements are still pending around the base.
+-- Model share of the run (measure = false) and longest measuring spell of one round as a share of the time limit
+-- (measure = true). They start at MODEL_SHARE / MODEL_MEASURE_SHARE and rise to the *_LATE values between a quarter and
+-- a half of the run (option modelRamp = false keeps them constant, and from scratch they always are: the ramp cost the scratch benchmark about 0.06 mean log): the first rounds should pay back quickly, while
+-- later ones can afford to measure the far nodes that the short rounds never reach. On ssf, a run 4 times longer found
+-- Eagle Eye and Cloth and Chain at the same evaluation count because its rounds measured more.
+local MODEL_SHARE_LATE = 0.6
+local MODEL_MEASURE_SHARE_LATE = 0.3
+function TreeOptimizer:ModelShares(measure)
+	local share, late = self.modelShare or MODEL_SHARE, MODEL_SHARE_LATE
+	if measure then
+		share, late = self.modelMeasureShare or MODEL_MEASURE_SHARE, MODEL_MEASURE_SHARE_LATE
+	end
+	if self.modelRamp == false or self.fromScratch then
+		return share
+	end
+	local ramp = m_max(0, m_min(1, ((self:Now() - self.startTime) / self.timeLimit - 0.25) / 0.25))
+	return share + (late - share) * ramp
+end
+
 function TreeOptimizer:ModelRound(deadline)
 	local model = self.model
 	if not model then
@@ -2514,7 +2538,7 @@ function TreeOptimizer:ModelRound(deadline)
 		local spent = self.evalCount - startEvals
 		if self.stopped or self:Now() >= deadline
 			or (spent >= chunk and math.floor(task.priority) ~= math.floor(tasks[i - 1].priority))
-			or (i > 1 and self:Now() - measureStart >= self.timeLimit * (self.modelMeasureShare or MODEL_MEASURE_SHARE)) then
+			or (i > 1 and self:Now() - measureStart >= self.timeLimit * self:ModelShares(true)) then
 			break
 		end
 		self:MeasureModelTask(model, task)
@@ -2891,7 +2915,6 @@ function TreeOptimizer:Run()
 	local bestLosses, bestLossesFor = { }, nil
 	local perturbedFor, perturbFailures
 	local modelTime = 0
-	local modelShare = self.modelShare or MODEL_SHARE
 	-- From scratch, the fill's tree is refined before the model measures anything: the model's measuring is a large
 	-- fixed cost that only pays off on a tree that is already decent
 	local scratchRefined = not self.fromScratch
@@ -2911,7 +2934,7 @@ function TreeOptimizer:Run()
 			local trial = self:Refine(self:CopyState(self.best), self.points, refineDeadline)
 			self:Track(trial)
 			state = trial
-		elseif self.useModel and modelRestingAt ~= bestKey and modelTime <= modelShare * (self:Now() - startTime) then
+		elseif self.useModel and modelRestingAt ~= bestKey and modelTime <= self:ModelShares(false) * (self:Now() - startTime) then
 			modelRounds = modelRounds + 1
 			local roundStart = self:Now()
 			local found, pending = self:ModelRound(deadline)
