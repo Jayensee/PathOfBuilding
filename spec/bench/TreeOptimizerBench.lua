@@ -22,7 +22,17 @@
 --                  their scores are NOT comparable with runs that have it (default: such builds fail with an error)
 --   BENCH_OPTIONS  extra optimizer options as Lua table fields, e.g. "useModel=false, maxPathLength=5"
 --
--- Times are os.clock() CPU seconds, the same clock the optimizer uses when running headless.
+--   BENCH_EVALS    N: run on the optimizer's evaluation clock (clock = "evals") with a budget of N calculations (timeLimit
+--                  = N * BENCH_EVALTIME). Runs are then deterministic for a seed whatever else the machine is doing, and
+--                  checkpoints are reported by evaluation count (250, 500, 1000, ... up to N) instead of seconds.
+--   BENCH_CLOCK    "evals" is the same as giving BENCH_EVALS (default budget 4000); "time" (default) is the CPU clock
+--   BENCH_EVALTIME nominal seconds per calculation under the evals clock (default 0.015)
+--
+-- Every run logs the model's predictions against the calculations that check them (optimizer.predictionLog) and
+-- reports per build: the count, mean absolute error of the log score, Spearman rank correlation, the share of predicted
+-- improvements that really improved, and the error by number of nodes changed from the model's base tree.
+--
+-- Times are os.clock() CPU seconds, the same clock the optimizer uses when running headless (time mode).
 --
 -- Builds with a Glorious Vanity jewel need src/Data/TimelessJewelData/GloriousVanity.bin (written by the desktop app the
 -- first time it loads such a build); headless runs can't decompress the .zip parts.
@@ -31,7 +41,10 @@
 
 local dkjson = require("dkjson")
 
-local CHECKPOINTS = { 1, 2, 5, 10, 20, 30, 45, 60, 90, 120, 180, 300 }
+local TIME_CHECKPOINTS = { 1, 2, 5, 10, 20, 30, 45, 60, 90, 120, 180, 300 }
+local EVAL_CHECKPOINTS = { 250, 500, 1000, 2000, 4000, 8000, 16000 }
+local CHECKPOINTS = TIME_CHECKPOINTS -- the list in use; switched to EVAL_CHECKPOINTS in evals mode
+local evalMode = false
 
 local function env(name, default)
 	local value = os.getenv(name)
@@ -82,7 +95,7 @@ local function instrument(optimizer, profile)
 		stats.phaseTime[lastPhase] = (stats.phaseTime[lastPhase] or 0) + (t - lastTick)
 		lastTick, lastPhase = t, optimizer.phase
 		local start = optimizer.startTime
-		if start then
+		if start and not evalMode then
 			while CHECKPOINTS[nextCheckpoint] and t - start >= CHECKPOINTS[nextCheckpoint] do
 				stats.checkpoints[nextCheckpoint] = { evals = optimizer.evalCount }
 				nextCheckpoint = nextCheckpoint + 1
@@ -267,7 +280,7 @@ end
 local function bestAt(events, t)
 	local best
 	for _, e in ipairs(events) do
-		if e.t <= t then
+		if e[evalMode and "evals" or "t"] <= t then
 			best = e
 		end
 	end
@@ -280,6 +293,125 @@ local function round(x, digits)
 	end
 	local m = 10 ^ (digits or 4)
 	return math.floor(x * m + 0.5) / m
+end
+
+-- Average ranks (ties share the mean rank)
+local function ranks(values)
+	local order = { }
+	for i = 1, #values do
+		order[i] = i
+	end
+	table.sort(order, function(a, b) if values[a] ~= values[b] then return values[a] < values[b] end return a < b end)
+	local result = { }
+	local i = 1
+	while i <= #order do
+		local j = i
+		while j < #order and values[order[j + 1]] == values[order[i]] do
+			j = j + 1
+		end
+		for k = i, j do
+			result[order[k]] = (i + j) / 2
+		end
+		i = j + 1
+	end
+	return result
+end
+
+local function pearson(x, y)
+	local n = #x
+	if n < 3 then
+		return nil
+	end
+	local mx, my = 0, 0
+	for i = 1, n do
+		mx, my = mx + x[i], my + y[i]
+	end
+	mx, my = mx / n, my / n
+	local sxy, sxx, syy = 0, 0, 0
+	for i = 1, n do
+		sxy = sxy + (x[i] - mx) * (y[i] - my)
+		sxx = sxx + (x[i] - mx) ^ 2
+		syy = syy + (y[i] - my) ^ 2
+	end
+	if sxx == 0 or syy == 0 then
+		return nil
+	end
+	return sxy / math.sqrt(sxx * syy)
+end
+
+local BUCKETS = { { 1, 5 }, { 6, 10 }, { 11, 20 }, { 21, math.huge } }
+
+-- Model predictions against the calculations that checked them (optimizer.predictionLog)
+local function predictionStats(log)
+	local stats = { count = #log }
+	if #log == 0 then
+		return stats
+	end
+	local predicted, real, absErr, signed = { }, { }, 0, 0
+	local predBetter, bothBetter, realBetterCount, defErr, defCount = 0, 0, 0, 0, 0
+	local buckets = { }
+	for i, b in ipairs(BUCKETS) do
+		buckets[i] = { from = b[1], to = b[2], count = 0, absErr = 0, signed = 0, predBetter = 0, bothBetter = 0 }
+	end
+	for i, p in ipairs(log) do
+		predicted[i], real[i] = p.predScore, p.realScore
+		local err = p.predScore - p.realScore
+		absErr, signed = absErr + math.abs(err), signed + err
+		defErr, defCount = defErr + math.abs(p.predDeficit - p.realDeficit), defCount + 1
+		if p.predBetter then
+			predBetter = predBetter + 1
+			if p.realBetter then
+				bothBetter = bothBetter + 1
+			end
+		end
+		if p.realBetter then
+			realBetterCount = realBetterCount + 1
+		end
+		for _, bucket in ipairs(buckets) do
+			if p.changed >= bucket.from and p.changed <= bucket.to then
+				bucket.count = bucket.count + 1
+				bucket.absErr = bucket.absErr + math.abs(err)
+				bucket.signed = bucket.signed + err
+				if p.predBetter then
+					bucket.predBetter = bucket.predBetter + 1
+					if p.realBetter then
+						bucket.bothBetter = bucket.bothBetter + 1
+					end
+				end
+			end
+		end
+	end
+	stats.maeScore = absErr / #log
+	stats.bias = signed / #log -- predicted minus real: positive means the model is optimistic
+	stats.maeDeficit = defErr / defCount
+	stats.spearman = pearson(ranks(predicted), ranks(real))
+	stats.predBetter = predBetter
+	stats.precision = predBetter > 0 and bothBetter / predBetter or nil
+	stats.realBetter = realBetterCount
+	for _, bucket in ipairs(buckets) do
+		if bucket.count > 0 then
+			bucket.maeScore = bucket.absErr / bucket.count
+			bucket.bias = bucket.signed / bucket.count
+			bucket.precision = bucket.predBetter > 0 and bucket.bothBetter / bucket.predBetter or nil
+		end
+	end
+	stats.buckets = buckets
+	return stats
+end
+
+-- Cheap fingerprint of a run's improvement events, to compare runs exactly
+local function fingerprint(events, final)
+	local h = 5381
+	local text = { }
+	for _, e in ipairs(events) do
+		text[#text + 1] = string.format("%d:%.17g:%.17g", e.evals, e.score, e.deficit)
+	end
+	text[#text + 1] = string.format("%.17g", final)
+	local s = table.concat(text, "|")
+	for i = 1, #s do
+		h = (h * 33 + s:byte(i)) % 4294967296
+	end
+	return string.format("%08x/%d", h, #events)
 end
 
 local function runOne(dir, file, mode, settings)
@@ -312,11 +444,11 @@ local function runOne(dir, file, mode, settings)
 	end
 	local curve = { }
 	for i, t in ipairs(CHECKPOINTS) do
-		if t <= settings.timeLimit + 1e-6 or i == 1 then
+		if t <= settings.limit + 1e-6 or i == 1 then
 			local e = bestAt(stats.events, t)
 			local entry = rel(e) or { }
 			entry.at = t
-			entry.evalsAt = stats.checkpoints[i] and stats.checkpoints[i].evals
+			entry.evalsAt = evalMode and t or (stats.checkpoints[i] and stats.checkpoints[i].evals)
 			table.insert(curve, entry)
 		end
 	end
@@ -374,6 +506,8 @@ local function runOne(dir, file, mode, settings)
 		modelRounds = result.modelRounds,
 		localOptima = result.localOptima,
 		curve = curve,
+		accuracy = predictionStats(optimizer.predictionLog or { }),
+		fingerprint = fingerprint(stats.events, finalEval.score),
 		events = stats.events,
 		phases = phases,
 		profile = profile,
@@ -413,6 +547,18 @@ local function printResult(r)
 			out("%-18s %8d %8.2f %8.2f %8s\n", p.name, p.calls, p.self, p.total, p.success or "")
 		end
 	end
+	local a = r.accuracy
+	if a and a.count > 0 then
+		out("model predictions: n=%d maeLog=%.4f bias=%+.4f maeDeficit=%.3g spearman=%s predictedBetter=%d realBetter=%d precision=%s\n", a.count, a.maeScore, a.bias, a.maeDeficit, a.spearman and string.format("%.3f", a.spearman) or "-", a.predBetter, a.realBetter, a.precision and string.format("%.2f", a.precision) or "-")
+		for _, b in ipairs(a.buckets) do
+			if b.count > 0 then
+				out("  changed %d-%s: n=%d maeLog=%.4f bias=%+.4f precision=%s\n", b.from, b.to == math.huge and "+" or tostring(b.to), b.count, b.maeScore, b.bias, b.precision and string.format("%.2f", b.precision) or "-")
+			end
+		end
+	else
+		out("model predictions: none\n")
+	end
+	out("fingerprint: %s\n", r.fingerprint)
 	out("improvements (t, ratio, phase):")
 	local init = r.initial
 	for i, e in ipairs(r.events) do
@@ -427,10 +573,10 @@ end
 
 local function printSummary(results, timeLimit)
 	out("\n==== Summary (ratio = optimizer value / hand-made value; ! = constraint deficit > 0) ====\n")
-	local cols = { 5, 10, 30, 60 }
+	local cols = evalMode and { 250, 500, 1000, 2000, 4000 } or { 5, 10, 30, 60 }
 	out("%-36s %-7s %10s %8s", "build", "mode", "hand-made", "fill")
 	for _, t in ipairs(cols) do
-		out(" %8s", t .. "s")
+		out(" %8s", t .. (evalMode and "e" or "s"))
 	end
 	out(" %8s %7s %6s %7s %8s\n", "final", "dlog", "evals", "ms/eval", "fillTime")
 	for _, r in ipairs(results) do
@@ -461,7 +607,7 @@ local function writeOutputs(results, dir, tag)
 	for _, r in ipairs(results) do
 		if not r.error then
 			local row = { r.build, r.mode, r.initial.value, r.initial.deficit, r.afterFill.ratio, r.fillTime }
-			for _, t in ipairs({ 1, 2, 5, 10, 20, 30, 60 }) do
+			for _, t in ipairs(evalMode and { 250, 500, 1000, 2000, 4000 } or { 1, 2, 5, 10, 20, 30, 60 }) do
 				local e = bestAt(r.events, t)
 				table.insert(row, e and round(e.value / r.initial.value, 5) or "")
 			end
@@ -482,19 +628,30 @@ describe("TreeOptimizer benchmark", function()
 	it("runs", function()
 		useUncompressedJewelData()
 		local dir = env("BENCH_DIR", "Builds/optimizer test builds")
+		local evalBudget = tonumber(env("BENCH_EVALS", "")) or (env("BENCH_CLOCK", "time") == "evals" and 4000 or nil)
+		local evalTime = tonumber(env("BENCH_EVALTIME", "0.015"))
 		local settings = {
 			timeLimit = tonumber(env("BENCH_TIME", "60")),
 			seed = tonumber(env("BENCH_SEED", "1")),
 			profile = env("BENCH_PROFILE", "1") ~= "0",
-			extra = { },
+			extra = { logPredictions = true },
 		}
+		evalMode = evalBudget ~= nil
+		CHECKPOINTS = evalMode and EVAL_CHECKPOINTS or TIME_CHECKPOINTS
+		settings.limit = settings.timeLimit
+		if evalMode then
+			settings.timeLimit = evalBudget * evalTime
+			settings.limit = evalBudget
+			settings.extra.clock = "evals"
+			settings.extra.evalTime = evalTime
+		end
 		local extraText = env("BENCH_OPTIONS", nil)
 		if extraText then
-			settings.extra = assert(loadstring("return { " .. extraText .. " }"))()
+			for k, v in pairs(assert(loadstring("return { " .. extraText .. " }"))()) do settings.extra[k] = v end
 		end
 		local modes = split(env("BENCH_MODES", "current,scratch"))
 		local files = findBuilds(dir, split(env("BENCH_BUILDS", "")))
-		out("\nTree optimizer bench: %d build(s), modes=%s, timeLimit=%ss, seed=%d, profile=%s\n", #files, table.concat(modes, "/"), settings.timeLimit, settings.seed, tostring(settings.profile))
+		out("\nTree optimizer bench: %d build(s), modes=%s, budget=%s%s, seed=%d, profile=%s\n", #files, table.concat(modes, "/"), settings.limit, evalMode and " evals" or "s", settings.seed, tostring(settings.profile))
 		local results = { }
 		for _, file in ipairs(files) do
 			for _, mode in ipairs(modes) do
@@ -506,7 +663,7 @@ describe("TreeOptimizer benchmark", function()
 				table.insert(results, r)
 			end
 		end
-		printSummary(results, settings.timeLimit)
+		printSummary(results, settings.limit)
 		local outDir = env("BENCH_OUT", nil)
 		if outDir then
 			writeOutputs(results, outDir, env("BENCH_TAG", "run"))
