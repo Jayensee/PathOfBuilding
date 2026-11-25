@@ -27,6 +27,7 @@
 --                  checkpoints are reported by evaluation count (250, 500, 1000, ... up to N) instead of seconds.
 --   BENCH_CLOCK    "evals" is the same as giving BENCH_EVALS (default budget 4000); "time" (default) is the CPU clock
 --   BENCH_EVALTIME nominal seconds per calculation under the evals clock (default 0.015)
+--   BENCH_DUMPLOG  any value: the JSON also carries every prediction log entry (per discovered field predicted and real values with the structured model)
 --
 -- Every run logs the model's predictions against the calculations that check them (optimizer.predictionLog) and
 -- reports per build: the count, mean absolute error of the log score, Spearman rank correlation, the share of predicted
@@ -509,6 +510,7 @@ local function runOne(dir, file, mode, settings)
 		accuracy = predictionStats(optimizer.predictionLog or { }),
 		structured = optimizer.structured,
 		discovered = optimizer.discPaths,
+		predictionLog = env("BENCH_DUMPLOG", nil) and optimizer.predictionLog or nil,
 		fingerprint = fingerprint(stats.events, finalEval.score),
 		events = stats.events,
 		phases = phases,
