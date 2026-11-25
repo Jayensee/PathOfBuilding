@@ -36,13 +36,13 @@
 --        many is picked, and sums of single-node effects drift: caps and saturating stats like total EHP). So each
 --        prediction is lowered by a penalty learned from this run's own checks (mean predicted - real per distance
 --        band, interpolated by changed-node count: RecordCheck, DistancePenalty), which steers both the model search
---        and the choice of trees to check. The structured model (on by default; it discovers the fields the score
+--        and the choice of trees to check. The structured model (off by default, opt in with structuredModel = true; it discovers the fields the score
 --        function reads and predicts each one, then runs the score function on the predicted output) is kept only while
 --        its checks are no worse than the plain sum's (StructuredWins). Saturating fields (total EHP, damage taken
 --        multipliers with a floor) overshoot far from the base, so every field is also calibrated on this run's checks
 --        (RecordFieldCheck): a factor in 0..1.2 on its summed log change, fitted by least squares and pulled towards 1
 --        while samples are few (FieldFactor), and a clamp to the range its real values have taken plus a margin
---        (FieldClamp). Nothing there knows any field or the formula.
+--        (FieldClamp). Nothing there knows any field or the formula. These calibration options apply only when the structured model is on; on the 4000-eval benchmark the structured model scored worse overall (mean log ratio 0.432 vs 0.525 with it off), so it stays off by default.
 --      - When the model rests (failed rounds with nothing left to measure), Refine runs on the best tree until its
 --        first improving move, so the model gets its turn on the better tree; at a local optimum, far swaps then
 --        random perturbation, each followed by Refine. Perturbation alternates between removing a few branches (more
@@ -101,7 +101,7 @@ local EPSILON = 1e-9
 ---@field timeLimit number? Seconds the whole run may take (the initial fill always completes).
 ---@field clock string? "evals" counts time in calculations (see DEFAULT_EVAL_TIME) so runs are deterministic; default is real time.
 ---@field evalTime number? Seconds one calculation counts for under the evals clock (default 0.015).
----@field structuredModel boolean? Predict the stat by running the score function on a predicted output (default true; each field's prediction is calibrated on the run's own checks, see FieldFactor), instead of summing log deltas of the stat itself. Falls back to the sum when its checks are worse.
+---@field structuredModel boolean? Predict the stat by running the score function on a predicted output (default false; set true to enable. Each field's prediction is calibrated on the run's own checks when fieldCalibration is on, see FieldFactor), instead of summing log deltas of the stat itself. Falls back to the sum when its checks are worse. Off by default because on the 4000-eval benchmark it scored worse overall: mean log ratio 0.432 vs 0.525 with it off.
 ---@field fieldCalibration boolean? Calibrate each field of the structured model on the run's own checks: a factor on its summed log change and a clamp to the range its real values have taken (default true).
 ---@field fieldClamp boolean? The clamp part of fieldCalibration (default true).
 ---@field scoreFunction fun(output: table): number? Replaces the power stat as the number to maximise (a function of the output table alone). Used by tests.
@@ -144,7 +144,7 @@ function TreeOptimizer.new(build, options)
 	self.captureFields = self.useModel
 	-- Structured model: the fields the score function reads are discovered from its first evaluations, and a tree's
 	-- stat is predicted by running the score function on a predicted output (see DiscoverFields)
-	self.structured = self.useModel and options.structuredModel ~= false
+	self.structured = self.useModel and options.structuredModel == true
 	-- What the model's checks have shown about its predictions (see RecordCheck)
 	self.distancePenalty = self.useModel and options.distancePenalty ~= false
 	self.calib = { buckets = { { n = 0, sum = 0 }, { n = 0, sum = 0 }, { n = 0, sum = 0 }, { n = 0, sum = 0 } },
