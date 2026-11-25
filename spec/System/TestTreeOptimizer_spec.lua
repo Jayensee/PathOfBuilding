@@ -61,6 +61,40 @@ describe("TreeOptimizer", function()
 		end)
 	end)
 
+	describe("structured model", function()
+		-- A score function the optimizer knows nothing about: it reads Life and FireResist, nothing else
+		local function score(output)
+			return output.Life * (100 + (output.FireResist or 0)) / 100
+		end
+
+		it("discovers the fields a custom score function reads, and predicts through it", function()
+			local optimizer = run({ points = 12, fromScratch = true, scoreFunction = score, structuredModel = true, clock = "evals", timeLimit = 1.5, maxEvals = math.huge })
+			assert.is_true(optimizer.structured)
+			assert.are.same({ "FireResist", "Life" }, optimizer.discPaths)
+			local model = optimizer.model
+			assert.is_truthy(model)
+			-- On the model's own base the predicted output is the base output, so the prediction is its real score
+			local predicted = optimizer:PredictLogValue(model, model.baseFields, { }, { })
+			assert.is_truthy(predicted)
+			assert.are.near(optimizer:Evaluate(model.base).fields.logValue, predicted, 1e-9)
+			-- Measured entries carry changes of exactly the discovered fields
+			local sawLog = false
+			for _, entry in pairs(model.with) do
+				for path in pairs(entry.dl or { }) do
+					assert.is_true(optimizer.discSet[path])
+					sawLog = true
+				end
+			end
+			assert.is_true(sawLog)
+		end)
+
+		it("falls back to the stat's own log when the structured model is off", function()
+			local optimizer = run({ points = 12, fromScratch = true, scoreFunction = score, structuredModel = false })
+			assert.is_false(optimizer.structured)
+			assert.are.same({ }, optimizer.discPaths)
+		end)
+	end)
+
 	it("fills the budget with a connected tree that improves the stat", function()
 		local optimizer, result = run({ points = 12, fromScratch = true })
 		assert.is_true(result.best.count <= 12)

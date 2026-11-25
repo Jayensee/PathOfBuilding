@@ -90,6 +90,8 @@ local EPSILON = 1e-9
 ---@field timeLimit number? Seconds the whole run may take (the initial fill always completes).
 ---@field clock string? "evals" counts time in calculations (see DEFAULT_EVAL_TIME) so runs are deterministic; default is real time.
 ---@field evalTime number? Seconds one calculation counts for under the evals clock (default 0.015).
+---@field structuredModel boolean? Predict the stat by running the score function on a predicted output (default false: mixed results), instead of summing log deltas of the stat itself.
+---@field scoreFunction fun(output: table): number? Replaces the power stat as the number to maximise (a function of the output table alone). Used by tests.
 ---@field logPredictions boolean? Record model predictions against the calculations that check them in self.predictionLog.
 ---@field maxEvals number? Hard cap on the number of calculations.
 ---@field onProgress fun(info: table)? Called after every calculation. Running inside a coroutine, it may yield.
@@ -126,6 +128,24 @@ function TreeOptimizer.new(build, options)
 	-- Keep the values the model needs from every calculation, so trees the search has calculated anyway (e.g. a
 	-- branch removed by Refine) serve as model measurements for free
 	self.captureFields = self.useModel
+	-- Structured model: the fields the score function reads are discovered from its first evaluations, and a tree's
+	-- stat is predicted by running the score function on a predicted output (see DiscoverFields)
+	self.structured = self.useModel and options.structuredModel == true
+	self.scoreFunction = options.scoreFunction
+	self.discRuns = 0
+	self.discPaths, self.discSet, self.discParts = { }, { }, { }
+	if options.scoreFunction then
+		self.scoreFunc = options.scoreFunction
+	elseif self.powerStat.stat == "PowerMetric" then
+		local calcs = build.calcsTab.calcs
+		self.scoreFunc = function(output)
+			return calcs.powerMetricFromOutput(output) or 0
+		end
+	else
+		self.scoreFunc = function(output)
+			return data.powerStatList.GetFromOutput(output, self.powerStat)
+		end
+	end
 	-- Seeded generator so runs are reproducible
 	local seed = options.seed or 1
 	self.random = function(lo, hi)
@@ -678,8 +698,79 @@ local CONSTRAINT_FIELDS = { "Str", "Dex", "Int", "Omni", "ReqStr", "ReqDex", "Re
 	"LifeLeechGainRate" }
 local CONSTRAINT_FLAGS = { "ChaosInoculation", "EnergyShieldProtectsMana" }
 
+-- A table that logs every key read from `t` into `reads` (path -> type of the value), with nested tables proxied
+-- too. Arrays are returned as they are (a proxy can't answer `#`): the formula reading only their length is
+-- recorded as a read of the array, which the model treats as constant.
+local function recordingProxy(t, prefix, reads)
+	return setmetatable({ }, { __index = function(_, key)
+		local value = t[key]
+		local path = prefix .. tostring(key)
+		reads[path] = type(value)
+		if type(value) == "table" and #value == 0 then
+			return recordingProxy(value, path .. ".", reads)
+		end
+		return value
+	end })
+end
+
+local function getPath(output, parts)
+	local value = output
+	for _, key in ipairs(parts) do
+		if type(value) ~= "table" then
+			return nil
+		end
+		value = value[key]
+	end
+	return value
+end
+
+-- Number of the first evaluations whose score function reads are recorded (branches can read different fields)
+local DISCOVERY_RUNS = 3
+
+-- Records which numeric output fields the score function reads on `output`, adding them to the modelled fields. If
+-- the function doesn't reproduce `value` on the proxy, or reads no number, the structured model is switched off.
+function TreeOptimizer:DiscoverFields(output, value)
+	self.discRuns = self.discRuns + 1
+	local reads = { }
+	local ok, result = pcall(self.scoreFunc, recordingProxy(output, "", reads))
+	if not ok or type(result) ~= "number" or math.abs(result - value) > 1e-9 * math.max(1, math.abs(value)) then
+		self.structured = false
+		return
+	end
+	local found = { }
+	for path, kind in pairs(reads) do
+		if kind == "number" and not self.discSet[path] then
+			t_insert(found, path)
+		end
+	end
+	t_sort(found)
+	for _, path in ipairs(found) do
+		self.discSet[path] = true
+		t_insert(self.discPaths, path)
+		local parts = { }
+		for part in path:gmatch("[^.]+") do
+			t_insert(parts, part)
+		end
+		self.discParts[path] = parts
+	end
+	if self.discRuns == 1 then
+		self.template = output
+	end
+	if self.discRuns >= DISCOVERY_RUNS and #self.discPaths == 0 then
+		self.structured = false
+	end
+end
+
 function TreeOptimizer:ScoreFromOutput(output)
-	local value = data.powerStatList.GetFromOutput(output, self.powerStat)
+	local value
+	if self.scoreFunction then
+		value = self.scoreFunction(output)
+	else
+		value = data.powerStatList.GetFromOutput(output, self.powerStat)
+	end
+	if self.structured and self.discRuns < DISCOVERY_RUNS then
+		self:DiscoverFields(output, value)
+	end
 	local deficit, attributes, violations, needs = self:ConstraintDeficit(output)
 	-- Work in log space so gains are relative (a 2% increase is worth the same anywhere)
 	local logValue = value > 0 and m_log(value) or (-100 + value * EPSILON)
@@ -691,6 +782,14 @@ function TreeOptimizer:ScoreFromOutput(output)
 		end
 		for _, key in ipairs(CONSTRAINT_FLAGS) do
 			fields[key] = output[key]
+		end
+		if self.structured then
+			for _, path in ipairs(self.discPaths) do
+				local v = getPath(output, self.discParts[path])
+				if type(v) == "number" and v == v and v ~= math.huge and v ~= -math.huge then
+					fields[path] = v
+				end
+			end
 		end
 	end
 	return {
@@ -1828,8 +1927,22 @@ local MODEL_SHARE = 0.4
 local MODEL_MEASURE_SHARE = 0.08
 
 -- Effect of moving from `base` to `eval` on the modelled values
-local function fieldDelta(base, fields)
+-- Second result: for the discovered paths, the change of their log where they are positive on both sides; third result:
+-- their raw change where not (only those paths). Predictions use the log changes while a path is positive on the base.
+local function fieldDelta(base, fields, paths)
 	local delta = { }
+	local dl, dr
+	if paths and #paths > 0 then
+		dl, dr = { }, { }
+		for _, path in ipairs(paths) do
+			local a, b = base[path], fields[path]
+			if a and b and a > 0 and b > 0 then
+				dl[path] = m_log(b / a)
+			elseif a or b then
+				dr[path] = (b or 0) - (a or 0)
+			end
+		end
+	end
 	for key, value in pairs(fields) do
 		if type(value) == "number" then
 			delta[key] = value - (base[key] or 0)
@@ -1840,7 +1953,7 @@ local function fieldDelta(base, fields)
 			delta[key] = -value
 		end
 	end
-	return delta
+	return delta, dl, dr
 end
 
 -- Number of nodes that differ between two trees (a mastery effect switch counts as one)
@@ -1877,6 +1990,12 @@ function TreeOptimizer:RebaseModel(model, base)
 	model.base = self:CopyState(base)
 	model.baseKey = stateKey(base)
 	model.baseFields = self:Evaluate(model.base).fields
+	-- Paths whose changes are predicted in log space: those positive on the base
+	model.logMode = { }
+	for _, path in ipairs(self.discPaths) do
+		local v = model.baseFields[path]
+		model.logMode[path] = v ~= nil and v > 0
+	end
 	model.bases[model.version] = model.base
 	model.drift = { [model.version] = 0 }
 	model.shared = { }
@@ -1993,7 +2112,7 @@ function TreeOptimizer:MeasureModelTask(model, task)
 	local signature = self:ModelSignature(model, task)
 	local shared = signature and model.shared[signature]
 	if shared then
-		model.with[task.key] = { delta = shared, version = model.version }
+		model.with[task.key] = { delta = shared[1], dl = shared[2], dr = shared[3], version = model.version }
 		model.known[id] = true
 		model.suspect[task.key] = nil
 		model.searched = false
@@ -2016,11 +2135,11 @@ function TreeOptimizer:MeasureModelTask(model, task)
 	end
 	local withFields = self:Evaluate(withState).fields
 	local withoutFields = self:Evaluate(withoutState).fields
-	local delta = fieldDelta(withoutFields, withFields)
+	local delta, dl, dr = fieldDelta(withoutFields, withFields, self.structured and self.discPaths)
 	if signature then
-		model.shared[signature] = delta
+		model.shared[signature] = { delta, dl, dr }
 	end
-	model.with[task.key] = { delta = delta, version = model.version }
+	model.with[task.key] = { delta = delta, dl = dl, dr = dr, version = model.version }
 	model.known[id] = true
 	model.suspect[task.key] = nil
 	model.searched = false
@@ -2060,6 +2179,8 @@ function TreeOptimizer:ModelFields(model, state)
 	local base = model.base
 	local with = model.with
 	local fields = copyTable(model.baseFields, true)
+	local structured = self.structured and #self.discPaths > 0
+	local logSum, rawSum, logMode = { }, { }, model.logMode
 	local function apply(key, sign)
 		local entry = with[key]
 		if not entry then
@@ -2067,6 +2188,18 @@ function TreeOptimizer:ModelFields(model, state)
 		end
 		for field, value in pairs(entry.delta) do
 			fields[field] = (fields[field] or 0) + sign * value
+		end
+		if structured and entry.dl then
+			for path, value in pairs(entry.dl) do
+				if logMode[path] then
+					logSum[path] = (logSum[path] or 0) + sign * value
+				end
+			end
+			for path, value in pairs(entry.dr) do
+				if logMode[path] then
+					rawSum[path] = (rawSum[path] or 0) + sign * value
+				end
+			end
 		end
 		return true
 	end
@@ -2087,7 +2220,51 @@ function TreeOptimizer:ModelFields(model, state)
 			return nil
 		end
 	end
+	if structured then
+		local predicted = self:PredictLogValue(model, fields, logSum, rawSum)
+		if predicted then
+			fields.logValue = predicted
+		end
+	end
 	return fields
+end
+
+-- Log of the score function on the output predicted for `fields`: the base's value of each discovered path moved by
+-- the summed log changes (and the raw changes of nodes that crossed zero) where the path is positive on the base, by
+-- the summed raw changes otherwise. Nil if the function can't run on it (the caller keeps the summed log of the stat).
+function TreeOptimizer:PredictLogValue(model, fields, logSum, rawSum)
+	local baseFields, logMode = model.baseFields, model.logMode
+	local predicted = setmetatable({ }, { __index = self.template })
+	for _, path in ipairs(self.discPaths) do
+		local value
+		local base = baseFields[path]
+		if logMode[path] then
+			value = base * math.exp(logSum[path] or 0) + (rawSum[path] or 0)
+		elseif base ~= nil or fields[path] ~= 0 then
+			value = fields[path]
+		else
+			value = false -- absent on the base and unchanged: hide the template's value
+		end
+		local parts = self.discParts[path]
+		local target = predicted
+		local source = self.template
+		for i = 1, #parts - 1 do
+			local part = parts[i]
+			source = type(source) == "table" and source[part] or nil
+			local nested = rawget(target, part)
+			if not nested then
+				nested = setmetatable({ }, { __index = type(source) == "table" and source or nil })
+				target[part] = nested
+			end
+			target = nested
+		end
+		target[parts[#parts]] = value
+	end
+	local ok, result = pcall(self.scoreFunc, predicted)
+	if not ok or type(result) ~= "number" or result ~= result then
+		return nil
+	end
+	return result > 0 and m_log(result) or (-100 + result * EPSILON)
 end
 
 -- Keys of the entries ModelFields uses to predict `state`

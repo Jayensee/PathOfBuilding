@@ -507,6 +507,8 @@ local function runOne(dir, file, mode, settings)
 		localOptima = result.localOptima,
 		curve = curve,
 		accuracy = predictionStats(optimizer.predictionLog or { }),
+		structured = optimizer.structured,
+		discovered = optimizer.discPaths,
 		fingerprint = fingerprint(stats.events, finalEval.score),
 		events = stats.events,
 		phases = phases,
